@@ -32,9 +32,13 @@ from .nn.layer_norm import (
     EquivariantRMSNormArraySphericalHarmonicsV2,
     get_normalization_layer,
 )
+from .nn.lr import (
+    heisenberg_potential_full_from_edge_inds,
+    potential_full_from_edge_inds,
+)
 from .nn.radial import EnvelopedBesselBasis, GaussianSmearing
 from .nn.so3_layers import SO3_Linear
-from .nn.lr import potential_full_from_edge_inds, heisenberg_potential_full_from_edge_inds
+
 
 @registry.register_model("esen_backbone")
 class eSEN_Backbone(nn.Module, GraphModelMixin):
@@ -429,6 +433,7 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         activation_checkpointing: bool = False,
         allowed_charges: list[int] | None = None,
         allowed_spins: list[int] | None = None,
+        latent_charge_tf: bool = False,
         heisenberg_tf: bool = False,
         j_coupling_nn: bool = False,
         constrain_charge: bool = False,
@@ -454,17 +459,21 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         self.constrain_charge = constrain_charge
         self.constrain_spin = constrain_spin
         self.heisenberg_tf = heisenberg_tf
+        self.latent_charge_tf = latent_charge_tf
         self.j_coupling_nn = j_coupling_nn
         self.allowed_charges = allowed_charges
         self.allowed_spins = allowed_spins
         self.hidden_channels_lr = hidden_channels_lr
 
         if allowed_spins is not None:
+            #print("summing spin channels")
             self.sphere_channels_sum += sphere_channels_spin
 
         if self.allowed_charges is not None:
             self.min_charge = int(min(allowed_charges))
             self.sphere_channels_sum += sphere_channels_charge
+            # if self.latent_charge_tf:
+            #    print("summing charge channels")
 
         self.otf_graph = otf_graph
         self.max_neighbors = max_neighbors
@@ -724,9 +733,11 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         embedding_in_vect = data_dict["atomic_numbers"]
 
         elem_embed = self.sphere_embedding(embedding_in_vect)
+
         if self.allowed_charges is not None:
             charge_embed = data_dict["charges"]
             elem_embed = torch.cat((elem_embed, charge_embed), dim=1)
+
         if self.allowed_spins is not None:
             spin_embed = data_dict["spins"]
             elem_embed = torch.cat((elem_embed, spin_embed), dim=1)
@@ -837,6 +848,8 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         self.hidden_channels = backbone.hidden_channels
         self.hidden_channels_lr = backbone.hidden_channels_lr
         self.heisenberg_tf = backbone.heisenberg_tf
+        self.latent_charge_tf = backbone.latent_charge_tf
+
         self.lr_comp_size = 1
         if self.heisenberg_tf:
             self.lr_comp_size = 2
@@ -849,13 +862,14 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             nn.Linear(self.hidden_channels, 1, bias=True),
         )
 
-        self.q_output_lr = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-        )
+        if self.latent_charge_tf:
+            self.q_output_lr = nn.Sequential(
+                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
+                nn.SiLU(),
+                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                nn.SiLU(),
+                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
+            )
 
         if self.heisenberg_tf:
             self.coupling_nn = nn.Sequential(
@@ -931,13 +945,15 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             emb["node_embedding"].narrow(1, 0, 1).squeeze()
         ).view(-1, 1, 1)
 
-        lr_energy = self.get_lr_energies(emb, data)
-
         energy = torch.zeros(
             len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
         )
         energy.index_add_(0, data["batch"], node_energy.view(-1))
-        energy.index_add_(0, data["batch"], lr_energy["energy"])
+
+        if self.latent_charge_tf:
+            lr_energy = self.get_lr_energies(emb, data)
+            energy.index_add_(0, data["batch"], lr_energy["energy"])
+
         if self.heisenberg_tf:
             energy.index_add_(0, data["batch"], lr_energy["energy_spin"])
 
@@ -979,6 +995,8 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
         self.hidden_channels = backbone.hidden_channels
         self.hidden_channels_lr = backbone.hidden_channels_lr
         self.heisenberg_tf = backbone.heisenberg_tf
+        self.latent_charge_tf = backbone.latent_charge_tf
+
         self.lr_comp_size = 1
         if self.heisenberg_tf:
             self.lr_comp_size = 2
@@ -991,13 +1009,14 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
             nn.Linear(self.hidden_channels, 1, bias=True),
         )
 
-        self.q_output_lr = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-        )
+        if self.latent_charge_tf:
+            self.q_output_lr = nn.Sequential(
+                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
+                nn.SiLU(),
+                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                nn.SiLU(),
+                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
+            )
 
         if self.heisenberg_tf:
             self.coupling_nn = nn.Sequential(
@@ -1063,7 +1082,6 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
         node_energy = self.energy_block(
             emb["node_embedding"].narrow(1, 0, 1).squeeze()
         ).view(-1, 1, 1)
-        lr_energy = self.get_lr_energies(emb, data_dict)
 
         energy = torch.zeros(
             len(data_dict["natoms"]),
@@ -1072,7 +1090,11 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
         )
 
         energy.index_add_(0, data_dict["batch"], node_energy.view(-1))
-        energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
+
+        if self.latent_charge_tf:
+            lr_energy = self.get_lr_energies(emb, data_dict)
+            energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
+
         if self.heisenberg_tf:
             energy.index_add_(0, data_dict["batch"], lr_energy["energy_spin"])
 
