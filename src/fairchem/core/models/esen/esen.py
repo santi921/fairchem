@@ -435,7 +435,6 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         allowed_spins: list[int] | None = None,
         latent_charge_tf: bool = False,
         heisenberg_tf: bool = False,
-        j_coupling_nn: bool = False,
         constrain_charge: bool = False,
         constrain_spin: bool = False,
         hidden_channels_lr: int = 128,
@@ -460,7 +459,6 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         self.constrain_spin = constrain_spin
         self.heisenberg_tf = heisenberg_tf
         self.latent_charge_tf = latent_charge_tf
-        self.j_coupling_nn = j_coupling_nn
         self.allowed_charges = allowed_charges
         self.allowed_spins = allowed_spins
         self.hidden_channels_lr = hidden_channels_lr
@@ -472,8 +470,6 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         if self.allowed_charges is not None:
             self.min_charge = int(min(allowed_charges))
             self.sphere_channels_sum += sphere_channels_charge
-            # if self.latent_charge_tf:
-            #    print("summing charge channels")
 
         self.otf_graph = otf_graph
         self.max_neighbors = max_neighbors
@@ -731,7 +727,6 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
             dtype=data_dict["pos"].dtype,
         )
         embedding_in_vect = data_dict["atomic_numbers"]
-
         elem_embed = self.sphere_embedding(embedding_in_vect)
 
         if self.allowed_charges is not None:
@@ -743,6 +738,7 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
             elem_embed = torch.cat((elem_embed, spin_embed), dim=1)
 
         x_message[:, 0, :] = elem_embed
+        
         # edge degree embedding - edge
         edge_distance_embedding = self.distance_expansion(graph_dict["edge_distance"])
         source_embedding = self.source_embedding(
@@ -982,6 +978,8 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 )[0]
             )
             outputs[forces_key] = forces
+        
+        
         return outputs
 
 
@@ -1120,6 +1118,18 @@ class Linear_Force_Head_LR(nn.Module, HeadInterface):
         forces = forces.view(-1, 3).contiguous()
         return {"forces": forces}
 
+@registry.register_model("esen_linear_force_head")
+class Linear_Force_Head(nn.Module, HeadInterface):
+    def __init__(self, backbone):
+        super().__init__()
+        self.linear = SO3_Linear(backbone.sphere_channels, 1, lmax=1)
+
+    def forward(self, data_dict, emb: dict[str, torch.Tensor]):
+        forces = self.linear(emb["node_embedding"].narrow(1, 0, 4))
+        forces = forces.narrow(1, 1, 3)
+        forces = forces.view(-1, 3).contiguous()
+        return {"forces": forces}
+
 
 @registry.register_model("esen_mlp_energy_head")
 class MLP_Energy_Head(nn.Module, HeadInterface):
@@ -1157,19 +1167,6 @@ class MLP_Energy_Head(nn.Module, HeadInterface):
             raise ValueError(
                 f"reduce can only be sum or mean, user provided: {self.reduce}"
             )
-
-
-@registry.register_model("esen_linear_force_head")
-class Linear_Force_Head(nn.Module, HeadInterface):
-    def __init__(self, backbone):
-        super().__init__()
-        self.linear = SO3_Linear(backbone.sphere_channels, 1, lmax=1)
-
-    def forward(self, data_dict, emb: dict[str, torch.Tensor]):
-        forces = self.linear(emb["node_embedding"].narrow(1, 0, 4))
-        forces = forces.narrow(1, 1, 3)
-        forces = forces.view(-1, 3).contiguous()
-        return {"forces": forces}
 
 
 @registry.register_model("esen_mlp_efs_head")
