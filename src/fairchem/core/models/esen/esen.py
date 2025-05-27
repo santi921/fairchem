@@ -464,7 +464,7 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
         self.hidden_channels_lr = hidden_channels_lr
 
         if allowed_spins is not None:
-            #print("summing spin channels")
+            # print("summing spin channels")
             self.sphere_channels_sum += sphere_channels_spin
 
         if self.allowed_charges is not None:
@@ -738,7 +738,7 @@ class General_eSEN_Backbone(nn.Module, GraphModelMixin):
             elem_embed = torch.cat((elem_embed, spin_embed), dim=1)
 
         x_message[:, 0, :] = elem_embed
-        
+
         # edge degree embedding - edge
         edge_distance_embedding = self.distance_expansion(graph_dict["edge_distance"])
         source_embedding = self.source_embedding(
@@ -978,8 +978,7 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 )[0]
             )
             outputs[forces_key] = forces
-        
-        
+
         return outputs
 
 
@@ -1117,6 +1116,7 @@ class Linear_Force_Head_LR(nn.Module, HeadInterface):
         forces = forces.narrow(1, 1, 3)
         forces = forces.view(-1, 3).contiguous()
         return {"forces": forces}
+
 
 @registry.register_model("esen_linear_force_head")
 class Linear_Force_Head(nn.Module, HeadInterface):

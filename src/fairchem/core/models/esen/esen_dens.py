@@ -504,7 +504,7 @@ class General_eSEN_DeNS_Backbone_LR(nn.Module, GraphModelMixin):
         self.sphere_channels_sum = sphere_channels
         self.sphere_channels_charge = sphere_channels_charge
         self.sphere_channels_spin = sphere_channels_spin
-        
+
         self.grid_resolution = grid_resolution
 
         self.regress_forces = regress_forces
@@ -561,7 +561,7 @@ class General_eSEN_DeNS_Backbone_LR(nn.Module, GraphModelMixin):
         if allowed_spins is not None:
             self.spin_embedding = nn.Embedding(
                 len(allowed_spins), self.sphere_channels_spin
-        )
+            )
 
         # atom embedding
         self.sphere_embedding = nn.Embedding(
@@ -783,7 +783,7 @@ class General_eSEN_DeNS_Backbone_LR(nn.Module, GraphModelMixin):
             device=data_dict["pos"].device,
             dtype=data_dict["pos"].dtype,
         )
-    
+
         elem_embed = self.sphere_embedding(data_dict["atomic_numbers"])
 
         if self.allowed_charges is not None:
@@ -793,7 +793,7 @@ class General_eSEN_DeNS_Backbone_LR(nn.Module, GraphModelMixin):
         if self.allowed_spins is not None:
             spin_embed = data_dict["spins"]
             elem_embed = torch.cat((elem_embed, spin_embed), dim=1)
-        
+
         x_message[:, 0, :] = elem_embed
 
         ##################
@@ -836,7 +836,7 @@ class General_eSEN_DeNS_Backbone_LR(nn.Module, GraphModelMixin):
         force_embedding = force_sh * force_norm
 
         force_embedding = self.force_embedding(force_embedding)
-        #print(force_embedding.shape)
+        # print(force_embedding.shape)
         x_message = x_message + force_embedding
 
         ##################
@@ -1034,7 +1034,6 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         return outputs
 
 
-    
 @registry.register_model("esen_mlp_efs_head_dens_lr")
 class MLP_EFS_Head_LR(nn.Module, HeadInterface):
     def __init__(self, backbone):
@@ -1083,7 +1082,7 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
 
         self.denoising_linear = SO3_Linear(self.sphere_channels, 1, lmax=1)
         backbone.direct_forces = False
-    
+
     def delete_denoising_head(self):
         self.denoising_linear = None
         self.denoising_pos = False
@@ -1192,7 +1191,6 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 )[0]
             )
             outputs[forces_key] = forces
-
 
         if self.denoising_pos:
             denoising_pos_vec = self.denoising_linear(
