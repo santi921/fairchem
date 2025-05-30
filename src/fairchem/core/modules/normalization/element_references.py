@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta, Inc. and its affiliates.
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -8,9 +8,8 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
-from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -18,12 +17,65 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from fairchem.core.datasets import data_list_collater
+from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
 
 from ._load_utils import _load_from_config
 
-if TYPE_CHECKING:
-    from torch_geometric.data import Batch
+
+class ElementReferences(nn.Module):
+    def __init__(
+        self,
+        element_references: torch.Tensor,
+    ):
+        """
+        Args:
+            element_references (Tensor): tensor with reference value for each element
+        """
+        super().__init__()
+        self.register_buffer(name="element_references", tensor=element_references)
+
+    @staticmethod
+    def compute_references(batch, tensor, elem_refs, operation):
+        assert tensor.shape[0] == len(batch)
+        with torch.autocast(elem_refs.device.type, enabled=False):
+            refs = torch.zeros(
+                tensor.shape, dtype=elem_refs.dtype, device=tensor.device
+            ).scatter_reduce(
+                0,
+                batch.batch_full,
+                elem_refs[batch.atomic_numbers_full],
+                reduce="sum",
+            )
+            if operation == "subtract":
+                return tensor - refs
+            elif operation == "add":
+                return tensor + refs
+            else:
+                raise ValueError(f"Unknown operation: {operation}")
+
+    def apply_refs(
+        self,
+        batch: AtomicData,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.compute_references(
+            batch,
+            tensor,
+            self.element_references,
+            operation="subtract",
+        )
+
+    def undo_refs(
+        self,
+        batch: AtomicData,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.compute_references(
+            batch,
+            tensor,
+            self.element_references,
+            operation="add",
+        )
 
 
 class LinearReferences(nn.Module):
@@ -59,13 +111,15 @@ class LinearReferences(nn.Module):
         super().__init__()
         self.register_buffer(
             name="element_references",
-            tensor=element_references
-            if element_references is not None
-            else torch.zeros(max_num_elements + 1),
+            tensor=(
+                element_references
+                if element_references is not None
+                else torch.zeros(max_num_elements + 1)
+            ),
         )
 
     def _apply_refs(
-        self, target: torch.Tensor, batch: Batch, sign: int, reshaped: bool = True
+        self, target: torch.Tensor, batch: AtomicData, sign: int, reshaped: bool = True
     ) -> torch.Tensor:
         """Apply references batch-wise"""
         indices = batch.atomic_numbers.to(
@@ -80,14 +134,14 @@ class LinearReferences(nn.Module):
 
     @torch.autocast(device_type="cuda", enabled=False)
     def dereference(
-        self, target: torch.Tensor, batch: Batch, reshaped: bool = True
+        self, target: torch.Tensor, batch: AtomicData, reshaped: bool = True
     ) -> torch.Tensor:
         """Remove linear references"""
         return self._apply_refs(target, batch, -1, reshaped=reshaped)
 
     @torch.autocast(device_type="cuda", enabled=False)
     def forward(
-        self, target: torch.Tensor, batch: Batch, reshaped: bool = True
+        self, target: torch.Tensor, batch: AtomicData, reshaped: bool = True
     ) -> torch.Tensor:
         """Add linear references"""
         return self._apply_refs(target, batch, 1, reshaped=reshaped)
@@ -179,7 +233,7 @@ def fit_linear_references(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=partial(data_list_collater, otf_graph=True),
+        collate_fn=atomicdata_list_to_batch,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
         generator=torch.Generator().manual_seed(seed),
@@ -224,7 +278,7 @@ def fit_linear_references(
             target_vectors[target][
                 i * batch_size : i * batch_size + next_batch_size
             ] = batch[target].to(torch.float64)
-        for j, data in enumerate(batch.to_data_list()):
+        for j, data in enumerate(batch.batch_to_atomicdata_list()):
             composition_matrix[i * batch_size + j] = torch.bincount(
                 data.atomic_numbers.int(),
                 minlength=max_num_elements,

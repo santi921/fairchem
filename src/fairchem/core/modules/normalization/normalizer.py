@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta, Inc. and its affiliates.
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import warnings
 from collections import defaultdict
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +19,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from fairchem.core.datasets import data_list_collater
+from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
 
 from ._load_utils import _load_from_config
 
@@ -205,7 +204,7 @@ def fit_normalizers(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=partial(data_list_collater, otf_graph=True),
+        collate_fn=atomicdata_list_to_batch,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
         generator=torch.Generator().manual_seed(seed),

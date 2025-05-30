@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta, Inc. and its affiliates.
+Copyright (c) Meta Platforms, Inc. and affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 """
@@ -54,13 +54,6 @@ class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
                 self.paths = [Path(self.config["src"])]
             else:
                 self.paths = tuple(Path(path) for path in sorted(config["src"]))
-
-        self.lin_ref = None
-        if self.config.get("lin_ref", False):
-            lin_ref = torch.tensor(
-                np.load(self.config["lin_ref"], allow_pickle=True)["coeff"]
-            )
-            self.lin_ref = torch.nn.Parameter(lin_ref, requires_grad=False)
 
     def __len__(self) -> int:
         return self.num_samples

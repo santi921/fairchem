@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta, Inc. and its affiliates.
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -26,7 +26,8 @@ from fairchem.core.datasets.base_dataset import (
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
-    from torch_geometric.data import Batch, Data
+
+    from fairchem.core.datasets.atomic_data import AtomicData
 
 
 @deprecated(
@@ -36,7 +37,7 @@ class OCPCollater:
     def __init__(self, otf_graph: bool = False) -> None:
         self.otf_graph = otf_graph
 
-    def __call__(self, data_list: list[Data]) -> Batch:
+    def __call__(self, data_list: list[AtomicData]) -> AtomicData:
         return data_list_collater(data_list, otf_graph=self.otf_graph)
 
 
