@@ -1,4 +1,4 @@
-# Studies leveraging FAIR-Chem
+# Studies leveraging pre-trained or fine-tuned FAIR-Chem models
 
 Many papers have now used FAIR-Chem models to accelerate screening and discovery efforts and enable new computational chemistry simulations. We highlight some here just to give an idea of the breadth of possibilities and how they have been used. Feel free to reach out (or submit PRs) if you want them included!
 

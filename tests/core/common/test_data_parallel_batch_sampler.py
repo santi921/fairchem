@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright (c) Meta, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -11,11 +11,15 @@ import functools
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    TypeVar,
+)
 
 import numpy as np
 import pytest
-from torch.utils.data import DistributedSampler
+from torch.utils.data import Dataset, DistributedSampler
 
 from fairchem.core.common.data_parallel import (
     BalancedBatchSampler,
@@ -26,19 +30,12 @@ from fairchem.core.common.data_parallel import (
 
 if TYPE_CHECKING:
     from numpy.typing import ArrayLike
-
-from fairchem.core.common.distutils import assign_device_for_local_rank
 from fairchem.core.datasets.base_dataset import BaseDataset
 
 DATA = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 SIZE_ATOMS = [2, 20, 3, 51, 10, 11, 41, 31, 13, 14]
 
 T_co = TypeVar("T_co", covariant=True)
-
-
-@pytest.fixture(scope="module")
-def bb_sampler_setup():
-    assign_device_for_local_rank(cpu=True, local_rank=0)
 
 
 @contextmanager
@@ -136,7 +133,7 @@ def invalid_dataset():
     return _Dataset(DATA)
 
 
-def test_lowercase(valid_dataset, bb_sampler_setup) -> None:
+def test_lowercase(valid_dataset) -> None:
     _ = BalancedBatchSampler(
         dataset=valid_dataset,
         batch_size=1,
@@ -149,7 +146,7 @@ def test_lowercase(valid_dataset, bb_sampler_setup) -> None:
     )
 
 
-def test_invalid_mode(invalid_dataset, bb_sampler_setup) -> None:
+def test_invalid_mode(invalid_dataset) -> None:
     with pytest.raises(
         ValueError,
         match="Only mode='atoms' or mode=True is supported, got mode='natoms'.",
@@ -181,9 +178,9 @@ def test_invalid_mode(invalid_dataset, bb_sampler_setup) -> None:
         )
 
 
-def test_invalid_dataset(invalid_dataset, bb_sampler_setup) -> None:
+def test_invalid_dataset(invalid_dataset) -> None:
     with pytest.raises(UnsupportedDatasetError):
-        BalancedBatchSampler(
+        sampler = BalancedBatchSampler(
             dataset=invalid_dataset,
             batch_size=1,
             rank=0,
@@ -195,7 +192,7 @@ def test_invalid_dataset(invalid_dataset, bb_sampler_setup) -> None:
         )
 
 
-def test_invalid_path_dataset(invalid_path_dataset, bb_sampler_setup) -> None:
+def test_invalid_path_dataset(invalid_path_dataset) -> None:
     with pytest.raises(
         UnsupportedDatasetError,
     ):
@@ -224,7 +221,7 @@ def test_invalid_path_dataset(invalid_path_dataset, bb_sampler_setup) -> None:
         )
 
 
-def test_valid_dataset(valid_dataset, valid_path_dataset, bb_sampler_setup) -> None:
+def test_valid_dataset(valid_dataset, valid_path_dataset) -> None:
     sampler = BalancedBatchSampler(
         dataset=valid_dataset,
         batch_size=1,
@@ -240,7 +237,7 @@ def test_valid_dataset(valid_dataset, valid_path_dataset, bb_sampler_setup) -> N
     ).all()
 
 
-def test_disabled(valid_dataset, bb_sampler_setup) -> None:
+def test_disabled(valid_dataset) -> None:
     sampler = BalancedBatchSampler(
         dataset=valid_dataset,
         batch_size=1,
@@ -254,7 +251,7 @@ def test_disabled(valid_dataset, bb_sampler_setup) -> None:
     assert sampler.disabled or not sampler._dist_enabled()
 
 
-def test_single_node(valid_dataset, bb_sampler_setup) -> None:
+def test_single_node(valid_dataset) -> None:
     sampler = BalancedBatchSampler(
         dataset=valid_dataset,
         batch_size=1,
@@ -283,7 +280,7 @@ def test_stateful_distributed_sampler_noshuffle(valid_dataset) -> None:
 
 
 def test_stateful_distributed_sampler_vs_distributed_sampler(
-    valid_dataset, bb_sampler_setup
+    valid_dataset,
 ) -> None:
     for seed in [0, 100, 200]:
         for batch_size in range(1, 4):
@@ -307,7 +304,7 @@ def test_stateful_distributed_sampler_vs_distributed_sampler(
             assert list(stateful_sampler) == list(sampler)
 
 
-def test_stateful_distributed_sampler(valid_dataset, bb_sampler_setup) -> None:
+def test_stateful_distributed_sampler(valid_dataset) -> None:
     for batch_size in range(1, 4):
         sampler = StatefulDistributedSampler(
             dataset=valid_dataset,
@@ -370,7 +367,9 @@ def test_stateful_distributed_sampler_numreplicas(valid_dataset) -> None:
                     assert set(concat_idxs) == fullset
 
 
-def test_stateful_distributed_sampler_numreplicas_drop_last(valid_dataset) -> None:
+def test_stateful_distributed_sampler_numreplicas_drop_last(
+    valid_dataset,
+) -> None:
     fullset = set(range(len(valid_dataset)))
     for num_replicas in range(1, 4):
         for batch_size in range(1, 4):

@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright (c) Meta, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -11,10 +11,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from fairchem.experimental.legacy.utils import load_config
-
 from fairchem.core.common.registry import registry
-from fairchem.core.common.utils import save_checkpoint
+from fairchem.core.common.utils import load_config, save_checkpoint
 from fairchem.core.modules.normalization.element_references import (
     create_element_references,
 )
