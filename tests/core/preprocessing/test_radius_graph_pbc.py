@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright (c) Facebook, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -8,19 +8,23 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import os
-from functools import partial
 
 import pytest
 import torch
-from ase import Atoms
 from ase.build import molecule
 from ase.io import read
 from ase.lattice.cubic import FaceCenteredCubic
+from torch_geometric.transforms.radius_graph import RadiusGraph
+from torch_geometric.utils import sort_edge_index
 
+from fairchem.core.common.utils import radius_graph_pbc
 from fairchem.core.datasets import data_list_collater
-from fairchem.core.datasets.atomic_data import AtomicData
-from fairchem.core.graph.compute import generate_graph
-from fairchem.core.graph.radius_graph_pbc import radius_graph_pbc, radius_graph_pbc_v2
+from fairchem.core.preprocessing import AtomsToGraphs
+from ase import Atoms
+from fairchem.core.datasets import data_list_collater
+
+from fairchem.core.common.utils import radius_graph_pbc
+from fairchem.core.preprocessing import AtomsToGraphs
 
 
 @pytest.fixture(scope="class")
@@ -30,9 +34,15 @@ def load_data(request) -> None:
         index=0,
         format="json",
     )
-    request.cls.data = AtomicData.from_ase(
-        atoms, max_neigh=200, radius=6, r_edges=True, r_data_keys=["spin", "charge"]
+    a2g = AtomsToGraphs(
+        max_neigh=200,
+        radius=6,
+        r_energy=True,
+        r_forces=True,
+        r_distances=True,
     )
+    data_list = a2g.convert_all([atoms])
+    request.cls.data = data_list[0]
 
 
 def check_features_match(
@@ -61,19 +71,15 @@ class TestRadiusGraphPBC:
     def test_radius_graph_pbc(self) -> None:
         data = self.data
         batch = data_list_collater([data] * 5)
-        generated_graphs = generate_graph(
-            data=batch,
-            cutoff=6,
-            max_neighbors=2000,
-            enforce_max_neighbors_strictly=False,
-            radius_pbc_version=1,
-            pbc=torch.BoolTensor([[True, True, False]] * 5),
+        edge_index, cell_offsets, neighbors = radius_graph_pbc(
+            batch,
+            radius=6,
+            max_num_neighbors_threshold=2000,
+            pbc=[True, True, False],
         )
+
         assert check_features_match(
-            batch.edge_index,
-            batch.cell_offsets,
-            generated_graphs["edge_index"],
-            generated_graphs["cell_offsets"],
+            batch.edge_index, batch.cell_offsets, edge_index, cell_offsets
         )
 
     def test_bulk(self) -> None:
@@ -82,16 +88,9 @@ class TestRadiusGraphPBC:
         # Must be sufficiently large to ensure all edges are retained
         max_neigh = 2000
 
-        a2g = partial(
-            AtomicData.from_ase,
-            max_neigh=max_neigh,
-            radius=radius,
-            r_edges=True,
-            r_data_keys=["spin", "charge"],
-        )
-
+        a2g = AtomsToGraphs(radius=radius, max_neigh=max_neigh)
         structure = FaceCenteredCubic("Pt", size=[1, 2, 3])
-        data = a2g(structure)
+        data = a2g.convert(structure)
         batch = data_list_collater([data])
 
         # Ensure adequate distance between repeated cells
@@ -100,106 +99,106 @@ class TestRadiusGraphPBC:
         structure.cell[2] *= radius
 
         # [False, False, False]
-        data = a2g(structure)
+        data = a2g.convert(structure)
         non_pbc = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([False, False, False]),
+            pbc=[False, False, False],
         )
 
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [True, False, False]
         structure.cell[0] /= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_x = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([True, False, False]),
+            pbc=[True, False, False],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [True, True, False]
         structure.cell[1] /= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_xy = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([True, True, False]),
+            pbc=[True, True, False],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [False, True, False]
         structure.cell[0] *= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_y = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([False, True, False]),
+            pbc=[False, True, False],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [False, True, True]
         structure.cell[2] /= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_yz = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([False, True, True]),
+            pbc=[False, True, True],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [False, False, True]
         structure.cell[1] *= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_z = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([False, False, True]),
+            pbc=[False, False, True],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [True, False, True]
         structure.cell[0] /= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_xz = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([True, False, True]),
+            pbc=[True, False, True],
         )
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
 
         # [True, True, True]
         structure.cell[1] /= radius
-        data = a2g(structure)
+        data = a2g.convert(structure)
         pbc_all = data.edge_index.shape[1]
 
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([True, True, True]),
+            pbc=[True, True, True],
         )
 
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
@@ -217,32 +216,30 @@ class TestRadiusGraphPBC:
         structure = FaceCenteredCubic("Pt", size=[1, 2, 3])
 
         # Ensure radius_graph_pbc matches radius_graph for non-PBC condition
-        # torch geometric's RadiusGraph requires torch_scatter
-        # RG = RadiusGraph(r=radius, max_num_neighbors=max_neigh)
-        # radgraph = RG(batch)
+        RG = RadiusGraph(r=radius, max_num_neighbors=max_neigh)
+        radgraph = RG(batch)
 
-        # out = radius_graph_pbc(
-        #     batch,
-        #     radius=radius,
-        #     max_num_neighbors_threshold=max_neigh,
-        #     pbc=[False, False, False],
-        # )
-        # assert (sort_edge_index(out[0]) == sort_edge_index(radgraph.edge_index)).all()
+        out = radius_graph_pbc(
+            batch,
+            radius=radius,
+            max_num_neighbors_threshold=max_neigh,
+            pbc=[False, False, False],
+        )
+        assert (sort_edge_index(out[0]) == sort_edge_index(radgraph.edge_index)).all()
 
     def test_molecule(self) -> None:
         radius = 6
         max_neigh = 1000
+        a2g = AtomsToGraphs(radius=radius, max_neigh=max_neigh)
         structure = molecule("CH3COOH")
         structure.cell = [[20, 0, 0], [0, 20, 0], [0, 0, 20]]
-        data = AtomicData.from_ase(
-            structure, radius=radius, max_neigh=max_neigh, r_edges=True
-        )
+        data = a2g.convert(structure)
         batch = data_list_collater([data])
         out = radius_graph_pbc(
             batch,
             radius=radius,
             max_num_neighbors_threshold=max_neigh,
-            pbc=torch.BoolTensor([False, False, False]),
+            pbc=[False, False, False],
         )
 
         assert check_features_match(data.edge_index, data.cell_offsets, out[0], out[1])
@@ -305,29 +302,27 @@ class TestRadiusGraphPBC:
     ],
 )
 def test_simple_systems_nopbc(
-    atoms,
-    expected_edge_index,
-    max_neighbors,
-    enforce_max_neighbors_strictly,
-    torch_deterministic,
+    atoms, expected_edge_index, max_neighbors, enforce_max_neighbors_strictly
 ):
-    data = AtomicData.from_ase(atoms)
+
+    a2g = AtomsToGraphs(
+        r_energy=False,
+        r_forces=False,
+        r_distances=False,
+        r_pbc=True,
+        r_edges=False,  # otf graph should not be a property of the model...
+    )
+
+    data = a2g.convert(atoms)
 
     batch = data_list_collater([data])
 
-    for radius_graph_pbc_fn in (radius_graph_pbc_v2, radius_graph_pbc):
-        edge_index, _, _ = radius_graph_pbc_fn(
-            batch,
-            radius=6,
-            max_num_neighbors_threshold=max_neighbors,
-            enforce_max_neighbors_strictly=enforce_max_neighbors_strictly,
-            pbc=torch.BoolTensor([False, False, False]),
-        )
+    edge_index, _, _ = radius_graph_pbc(
+        batch,
+        radius=6,
+        max_num_neighbors_threshold=max_neighbors,
+        enforce_max_neighbors_strictly=enforce_max_neighbors_strictly,
+        pbc=[False, False, False],
+    )
 
-        assert (
-            len(
-                set(tuple(x) for x in edge_index.T.tolist())
-                - set(tuple(x) for x in expected_edge_index.T.tolist())
-            )
-            == 0
-        )
+    assert (edge_index == expected_edge_index).all()

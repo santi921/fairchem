@@ -1,5 +1,5 @@
 """
-Copyright (c) Meta Platforms, Inc. and affiliates.
+Copyright (c) Facebook, Inc. and its affiliates.
 
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath("../../"))
 # -- Project information -----------------------------------------------------
 
 project = "FAIR Chem"
-copyright = "2020, Meta Platforms, Inc."
+copyright = "2020, Facebook, Inc."
 author = "Anuroop Sriram, Zach Ulissi"
 
 
