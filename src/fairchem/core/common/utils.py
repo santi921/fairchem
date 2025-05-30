@@ -270,6 +270,29 @@ def add_edge_distance_to_graph(
     return batch
 
 
+def one_hot_encode(
+    data: torch.Tensor, n_nodes: torch.Tensor, allowed_values: torch.Tensor
+) -> torch.Tensor:
+    """
+    One-hot encode the data.
+    Takes:
+        data: (num_graphs, )
+        n_nodes: (num_graphs, )
+        allowed_values: (num_values, )
+    Returns:
+        data: (sum(n_nodes), num_values)
+    """
+    list_data = []
+
+    for i in n_nodes:
+        global_temp = data[i]
+        data_temp = global_temp.expand(i).reshape(-1)
+        data_temp = (data_temp.unsqueeze(1) == allowed_values).float()
+        list_data.append(data_temp)
+    data = torch.cat(list_data)
+    return data
+
+
 def _import_local_file(path: Path, *, project_root: Path) -> None:
     """
     Imports a Python file as a module

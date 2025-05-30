@@ -42,6 +42,11 @@ class GraphData:
     batch_full: torch.Tensor  # used for GP functionality
     atomic_numbers_full: torch.Tensor  # used for GP functionality
     node_offset: int = 0  # used for GP functionality
+    spin: torch.Tensor | None = None
+    charge: torch.Tensor | None = None
+    partial_charge: torch.Tensor | None = None
+    partial_spin: torch.Tensor | None = None
+    dipole: torch.Tensor | None = None
 
 
 class GraphModelMixin:
