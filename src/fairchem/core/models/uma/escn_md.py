@@ -1457,6 +1457,14 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         )
         energy_part.index_add_(0, data["batch"], node_energy.view(-1))
 
+        if self.latent_charge_tf:
+            lr_energy = self.get_lr_energies(emb, data)
+            energy_part.index_add_(0, data["batch"], lr_energy["energy"])
+
+        if self.heisenberg_tf:
+            energy_part.index_add_(0, data["batch"], lr_energy["energy_spin"])
+
+
         if gp_utils.initialized():
             energy = gp_utils.reduce_from_model_parallel_region(energy_part)
         else:
@@ -1497,6 +1505,7 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             if gp_utils.initialized():
                 forces = gp_utils.reduce_from_model_parallel_region(forces)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
+        #print("outputs: ", outputs)
         return outputs
 
 
