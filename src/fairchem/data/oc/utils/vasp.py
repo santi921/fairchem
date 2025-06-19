@@ -67,8 +67,8 @@ def calculate_surface_k_points(atoms):
     b0 = np.linalg.norm(cell[1], ord=order)
     multiplier = 40
     return (
-        max(1, int(round(multiplier / a0))),
-        max(1, int(round(multiplier / b0))),
+        max(1, round(multiplier / a0)),
+        max(1, round(multiplier / b0)),
         1,
     )
 

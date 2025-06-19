@@ -348,8 +348,8 @@ def tile_atoms(atoms: ase.Atoms, min_ab: float = 8):
     """
     a_length = np.linalg.norm(atoms.cell[0])
     b_length = np.linalg.norm(atoms.cell[1])
-    na = int(math.ceil(min_ab / a_length))
-    nb = int(math.ceil(min_ab / b_length))
+    na = math.ceil(min_ab / a_length)
+    nb = math.ceil(min_ab / b_length)
     n_abc = (na, nb, 1)
     return atoms.repeat(n_abc)
 
