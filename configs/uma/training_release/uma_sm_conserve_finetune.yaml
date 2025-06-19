@@ -124,7 +124,7 @@ eval_dataloader:
 
 
 heads:
-  energyandforcehead:
+  :
     module: fairchem.core.models.uma.escn_moe.DatasetSpecificSingleHeadWrapper
     head_cls: fairchem.core.models.uma.escn_md.MLP_EFS_Head
     head_kwargs:
