@@ -1,0 +1,8 @@
+run_dir: results_test_4M_base
+mode: LOCAL
+device: CUDA
+ranks_per_node: 1
+dataloader_workers: 0
+debug: True
+mem_gb: 20
+cpus_per_task: 4

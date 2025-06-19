@@ -23,13 +23,13 @@ from .uma.escn_moe import eSCNMDMoeBackbone, eSCNMDMoeBackboneLR
 torch.set_float32_matmul_precision("high")
 
 __all__ = [
-    "eSCNMDBackbone",
-    "eSCNMDBackboneLRMLP_EFS_Head",
+    "MLP_EFS_Head_LR",
     "MLP_Energy_Head",
+    "MLP_Energy_Head_LR",
     "MLP_Stress_Head",
     "MLP_Stress_Head_LR",
-    "MLP_EFS_Head_LR",
-    "MLP_Energy_Head_LR",
+    "eSCNMDBackbone",
+    "eSCNMDBackboneLRMLP_EFS_Head",
     "eSCNMDMoeBackbone",
     "eSCNMDMoeBackboneLR",
 ]
