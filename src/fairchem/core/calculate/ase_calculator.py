@@ -82,9 +82,9 @@ class FAIRChemCalculator(Calculator):
         logging.debug(f"Available task names: {self.predictor.datasets}")
 
         if task_name is not None:
-            assert (
-                task_name in self.predictor.datasets
-            ), f"Given: {task_name}, Valid options are {self.predictor.datasets}"
+            assert task_name in self.predictor.datasets, (
+                f"Given: {task_name}, Valid options are {self.predictor.datasets}"
+            )
             self._task_name = task_name
         elif len(self.predictor.datasets) == 1:
             self._task_name = self.predictor.datasets[0]
@@ -208,9 +208,9 @@ class FAIRChemCalculator(Calculator):
             - `charge` and `spin` are currently only used for the `omol` head.
             - The `free_energy` is simply a copy of the `energy` and is not the actual electronic free energy. It is only set for ASE routines/optimizers that are hard-coded to use this rather than the `energy` key.
         """
-        assert (
-            self.task_name is not None
-        ), "You must set a task name before attempting to use the calculator"
+        assert self.task_name is not None, (
+            "You must set a task name before attempting to use the calculator"
+        )
 
         # Our calculators won't work if natoms=0
         if len(atoms) == 0:

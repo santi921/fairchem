@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from ase import Atoms
 from ase.data import covalent_radii
+
 from fairchem.data.oc.core.adsorbate_slab_config import AdsorbateSlabConfig
 
 if TYPE_CHECKING:

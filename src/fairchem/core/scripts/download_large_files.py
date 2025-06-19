@@ -124,7 +124,7 @@ def download_file_group(file_group: str, test_par_dir: Path | None = None) -> No
         files_to_download = [item for group in FILE_GROUPS.values() for item in group]
     else:
         raise ValueError(
-            f'Requested file group {file_group} not recognized. Please select one of {["ALL", *list(FILE_GROUPS)]}'
+            f"Requested file group {file_group} not recognized. Please select one of {['ALL', *list(FILE_GROUPS)]}"
         )
 
     fc_root = fairchem_root()

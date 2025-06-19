@@ -167,30 +167,30 @@ class ExponentialMovingAverage:
             raise ValueError("Decay must be between 0 and 1")
 
         self.num_updates = state_dict["num_updates"]
-        assert self.num_updates is None or isinstance(
-            self.num_updates, int
-        ), "Invalid num_updates"
+        assert self.num_updates is None or isinstance(self.num_updates, int), (
+            "Invalid num_updates"
+        )
 
-        assert isinstance(
-            state_dict["shadow_params"], list
-        ), "shadow_params must be a list"
+        assert isinstance(state_dict["shadow_params"], list), (
+            "shadow_params must be a list"
+        )
         self.shadow_params = [
             p.to(self.shadow_params[i].device)
             for i, p in enumerate(state_dict["shadow_params"])
         ]
-        assert all(
-            isinstance(p, torch.Tensor) for p in self.shadow_params
-        ), "shadow_params must all be Tensors"
+        assert all(isinstance(p, torch.Tensor) for p in self.shadow_params), (
+            "shadow_params must all be Tensors"
+        )
 
-        assert isinstance(
-            state_dict["collected_params"], list
-        ), "collected_params must be a list"
+        assert isinstance(state_dict["collected_params"], list), (
+            "collected_params must be a list"
+        )
         # collected_params is empty at initialization,
         # so use shadow_params for device instead
         self.collected_params = [
             p.to(self.shadow_params[i].device)
             for i, p in enumerate(state_dict["collected_params"])
         ]
-        assert all(
-            isinstance(p, torch.Tensor) for p in self.collected_params
-        ), "collected_params must all be Tensors"
+        assert all(isinstance(p, torch.Tensor) for p in self.collected_params), (
+            "collected_params must all be Tensors"
+        )

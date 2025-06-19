@@ -131,9 +131,9 @@ class Registry:
         def wrap(func):
             from torch import nn
 
-            assert issubclass(
-                func, nn.Module
-            ), "All loss must inherit torch.nn.Module class"
+            assert issubclass(func, nn.Module), (
+                "All loss must inherit torch.nn.Module class"
+            )
             cls.mapping["loss_name_mapping"][name] = func
             return func
 

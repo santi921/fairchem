@@ -18,13 +18,13 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
-from fairchem.experimental.legacy.utils import build_config
 from torch.nn.parallel.distributed import DistributedDataParallel
 
 from fairchem.core.common.flags import flags
 from fairchem.core.common.utils import new_trainer_context, setup_logging
 from fairchem.core.modules.scaling import ScaleFactor
 from fairchem.core.modules.scaling.compat import load_scales_compat
+from fairchem.experimental.legacy.utils import build_config
 
 if TYPE_CHECKING:
     from fairchem.core.trainers.base_trainer import BaseTrainer
@@ -52,9 +52,9 @@ def compute_scaling_factors(config, num_batches: int = 16) -> None:
         trainer = ctx.trainer
 
         ckpt_file = config.get("checkpoint", None)
-        assert (
-            ckpt_file is not None
-        ), "Checkpoint file not specified. Please specify --checkpoint <path>"
+        assert ckpt_file is not None, (
+            "Checkpoint file not specified. Please specify --checkpoint <path>"
+        )
         ckpt_file = Path(ckpt_file)
 
         logging.info(f"Input checkpoint path: {ckpt_file}, {ckpt_file.exists()=}")
@@ -124,8 +124,7 @@ def compute_scaling_factors(config, num_batches: int = 16) -> None:
         if ckpt_file.exists():
             logging.warning(f"Already found existing file: {ckpt_file}")
             flag = input(
-                "Do you want to continue and overwrite existing file (1), "
-                "or exit (2)? "
+                "Do you want to continue and overwrite existing file (1), or exit (2)? "
             )
             if str(flag) == "1":
                 logging.info("Overwriting existing file.")

@@ -42,7 +42,10 @@ from fairchem.core.models.uma.nn.mole_utils import MOLEInterface
 from fairchem.core.models.uma.nn.radial import GaussianSmearing
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
 from fairchem.core.models.utils.irreps import cg_change_mat, irreps_sum
-from fairchem.core.models.utils.lr import potential_full_from_edge_inds, heisenberg_potential_full_from_edge_inds
+from fairchem.core.models.utils.lr import (
+    heisenberg_potential_full_from_edge_inds,
+    potential_full_from_edge_inds,
+)
 
 from .escn_md_block import eSCNMD_Block
 
@@ -163,9 +166,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         self.dataset_list = dataset_list
         self.use_dataset_embedding = use_dataset_embedding
         self.use_cuda_graph_wigner = use_cuda_graph_wigner
-        assert (
-            self.dataset_list
-        ), "the dataset list is empty, please add it to the model backbone config"
+        assert self.dataset_list, (
+            "the dataset list is empty, please add it to the model backbone config"
+        )
 
         # rotation utils
         Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
@@ -395,13 +398,13 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             if self.always_use_pbc:
                 pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
             else:
-                assert (
-                    "pbc" in data_dict
-                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                assert "pbc" in data_dict, (
+                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                )
                 pbc = data_dict["pbc"]
-            assert (
-                pbc.all() or (~pbc).all()
-            ), "We can only accept pbc that is all true or all false"
+            assert pbc.all() or (~pbc).all(), (
+                "We can only accept pbc that is all true or all false"
+            )
             logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
             graph_dict = generate_graph(
                 data_dict,
@@ -413,9 +416,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
         else:
             # this assume edge_index is provided
-            assert (
-                "edge_index" in data_dict
-            ), "otf_graph is false, need to provide edge_index as input!"
+            assert "edge_index" in data_dict, (
+                "otf_graph is false, need to provide edge_index as input!"
+            )
             cell_per_edge = data_dict["cell"].repeat_interleave(
                 data_dict["nedges"], dim=0
             )
@@ -601,9 +604,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             gp_utils.get_gp_world_size(),
         )[gp_utils.get_gp_rank()]
 
-        assert (
-            node_partition.numel() > 0
-        ), "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+        assert node_partition.numel() > 0, (
+            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+        )
         edge_partition = torch.where(
             torch.logical_and(
                 edge_index[1] >= node_partition.min(),
@@ -658,6 +661,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     no_wd_list.append(global_parameter_name)
 
         return set(no_wd_list)
+
 
 @registry.register_model("escnmd_backbone_lr")
 class eSCNMDBackboneLR(nn.Module, MOLEInterface):
@@ -736,9 +740,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         self.dataset_list = dataset_list
         self.use_dataset_embedding = use_dataset_embedding
         self.use_cuda_graph_wigner = use_cuda_graph_wigner
-        assert (
-            self.dataset_list
-        ), "the dataset list is empty, please add it to the model backbone config"
+        assert self.dataset_list, (
+            "the dataset list is empty, please add it to the model backbone config"
+        )
 
         # rotation utils
         Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
@@ -833,7 +837,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         self.norm_type = norm_type
         self.act_type = act_type
         self.ff_type = ff_type
-        
+
         # LR
         self.hidden_channels_lr = hidden_channels_lr
         self.heisenberg_tf = heisenberg_tf
@@ -973,13 +977,13 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             if self.always_use_pbc:
                 pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
             else:
-                assert (
-                    "pbc" in data_dict
-                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                assert "pbc" in data_dict, (
+                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                )
                 pbc = data_dict["pbc"]
-            assert (
-                pbc.all() or (~pbc).all()
-            ), "We can only accept pbc that is all true or all false"
+            assert pbc.all() or (~pbc).all(), (
+                "We can only accept pbc that is all true or all false"
+            )
             logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
             graph_dict = generate_graph(
                 data_dict,
@@ -991,9 +995,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             )
         else:
             # this assume edge_index is provided
-            assert (
-                "edge_index" in data_dict
-            ), "otf_graph is false, need to provide edge_index as input!"
+            assert "edge_index" in data_dict, (
+                "otf_graph is false, need to provide edge_index as input!"
+            )
             cell_per_edge = data_dict["cell"].repeat_interleave(
                 data_dict["nedges"], dim=0
             )
@@ -1179,9 +1183,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             gp_utils.get_gp_world_size(),
         )[gp_utils.get_gp_rank()]
 
-        assert (
-            node_partition.numel() > 0
-        ), "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+        assert node_partition.numel() > 0, (
+            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+        )
         edge_partition = torch.where(
             torch.logical_and(
                 edge_index[1] >= node_partition.min(),
@@ -1238,7 +1242,6 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         return set(no_wd_list)
 
 
-
 @registry.register_model("esen_efs_head")
 class MLP_EFS_Head(nn.Module, HeadInterface):
     def __init__(self, backbone, prefix=None, wrap_property=True):
@@ -1264,9 +1267,9 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         # but is currently necessary for finetuning pretrained models that did not have
         # the direct_forces flag set to False
         backbone.direct_forces = False
-        assert (
-            not backbone.direct_forces
-        ), "EFS head is only used for gradient-based forces/stress."
+        assert not backbone.direct_forces, (
+            "EFS head is only used for gradient-based forces/stress."
+        )
 
     @conditional_grad(torch.enable_grad())
     def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -1344,7 +1347,9 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
 
         self.sphere_channels = backbone.sphere_channels
         self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = backbone.hidden_channels_lr # this might not be in the backbone
+        self.hidden_channels_lr = (
+            backbone.hidden_channels_lr
+        )  # this might not be in the backbone
         self.heisenberg_tf = backbone.heisenberg_tf
         self.latent_charge_tf = backbone.latent_charge_tf
 
@@ -1382,9 +1387,9 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         # but is currently necessary for finetuning pretrained models that did not have
         # the direct_forces flag set to False
         backbone.direct_forces = False
-        assert (
-            not backbone.direct_forces
-        ), "EFS head is only used for gradient-based forces/stress."
+        assert not backbone.direct_forces, (
+            "EFS head is only used for gradient-based forces/stress."
+        )
 
     def get_charges(self, node_features):
         results = {}
@@ -1464,7 +1469,6 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         if self.heisenberg_tf:
             energy_part.index_add_(0, data["batch"], lr_energy["energy_spin"])
 
-
         if gp_utils.initialized():
             energy = gp_utils.reduce_from_model_parallel_region(energy_part)
         else:
@@ -1505,7 +1509,7 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             if gp_utils.initialized():
                 forces = gp_utils.reduce_from_model_parallel_region(forces)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-        #print("outputs: ", outputs)
+        # print("outputs: ", outputs)
         return outputs
 
 
@@ -1541,7 +1545,7 @@ class MLP_Energy_Head(nn.Module, HeadInterface):
             energy = gp_utils.reduce_from_model_parallel_region(energy_part)
         else:
             energy = energy_part
-        
+
         if self.reduce == "sum":
             return {"energy": energy}
         elif self.reduce == "mean":
@@ -1561,7 +1565,9 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
         self.sphere_channels = backbone.sphere_channels
 
         self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = backbone.hidden_channels_lr # this might not be in the backbone
+        self.hidden_channels_lr = (
+            backbone.hidden_channels_lr
+        )  # this might not be in the backbone
         self.heisenberg_tf = backbone.heisenberg_tf
         self.latent_charge_tf = backbone.latent_charge_tf
 
@@ -1787,7 +1793,3 @@ class MLP_Stress_Head(nn.Module, HeadInterface):
         stress = compose_tensor(iso_stress.unsqueeze(1), aniso_stress)
 
         return {"stress": stress}
-
-
-
-

@@ -18,6 +18,7 @@ __email__ = "ktran@andrew.cmu.edu"
 
 import numpy as np
 from ase.calculators.vasp import Vasp
+
 from fairchem.data.oc.utils.vasp_flags import VASP_FLAGS
 
 

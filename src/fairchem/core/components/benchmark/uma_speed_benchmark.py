@@ -84,7 +84,7 @@ def get_qps(data, predictor, warmups: int = 10, timeiters: int = 100):
 
     for _ in range(warmups):
         timefunc()
-        logging.info(f"memory allocated: {torch.cuda.memory_allocated()/(1024**3)}")
+        logging.info(f"memory allocated: {torch.cuda.memory_allocated() / (1024**3)}")
 
     result = timeit.timeit(timefunc, number=timeiters)
     qps = timeiters / result

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import ase.io
 import numpy as np
+
 from fairchem.data.oc.core.adsorbate_slab_config import there_is_overlap
 from fairchem.data.oc.core.multi_adsorbate_slab_config import (
     MultipleAdsorbateSlabConfig,

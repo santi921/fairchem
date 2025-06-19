@@ -12,6 +12,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 from ase.atoms import Atoms
+
 from fairchem.data.oc.core.adsorbate import Adsorbate
 from fairchem.data.oc.core.multi_adsorbate_slab_config import (
     MultipleAdsorbateSlabConfig,
@@ -105,9 +106,9 @@ def adsorb_ml_pipeline(
     ]
 
     if reference_ml_energies:
-        assert (
-            atomic_reference_energies is not None
-        ), "Missing atomic reference energies"
+        assert atomic_reference_energies is not None, (
+            "Missing atomic reference energies"
+        )
 
         ml_relaxed_configurations = reference_adslab_energies(
             ml_relaxed_configurations,

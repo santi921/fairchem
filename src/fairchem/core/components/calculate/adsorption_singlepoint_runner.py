@@ -53,9 +53,9 @@ class AdsorptionSinglePointRunner(CalculateRunner):
         self.evaluate_total_energy = evaluate_total_energy
         self.adsorption_energy_model = adsorption_energy_model
         if self.adsorption_energy_model:
-            assert (
-                not self.evaluate_total_energy
-            ), "Total energy evals not available for adsorption energy models"
+            assert not self.evaluate_total_energy, (
+                "Total energy evals not available for adsorption energy models"
+            )
         super().__init__(calculator=calculator, input_data=input_data)
 
     def calculate(self, job_num: int = 0, num_jobs: int = 1) -> list[dict[str, Any]]:

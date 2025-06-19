@@ -101,9 +101,9 @@ class HydraModel(nn.Module):
             logging.info(
                 f"Found and loaded fine-tuning checkpoint: {finetune_config['starting_checkpoint']} (Note we are NOT loading the training state from this checkpoint, only parts of the model and weights)"
             )
-            assert isinstance(
-                starting_model, HydraModel
-            ), "Can only finetune starting from other hydra models!"
+            assert isinstance(starting_model, HydraModel), (
+                "Can only finetune starting from other hydra models!"
+            )
             # TODO this is a bit hacky to overrride attrs in the backbone
             if "override" in finetune_config:
                 for key, value in finetune_config["override"].items():
@@ -137,9 +137,9 @@ class HydraModel(nn.Module):
             self.output_heads: dict[str, HeadInterface] = {}
 
             head_names_sorted = sorted(heads.keys())
-            assert len(set(head_names_sorted)) == len(
-                head_names_sorted
-            ), "Head names must be unique!"
+            assert len(set(head_names_sorted)) == len(head_names_sorted), (
+                "Head names must be unique!"
+            )
             for head_name in head_names_sorted:
                 head_config = heads[head_name]
                 if "module" not in head_config:
@@ -170,9 +170,9 @@ class HydraModel(nn.Module):
             device_from_tensors = {
                 x.device.type for x in data.values() if isinstance(x, torch.Tensor)
             }
-            assert (
-                len(device_from_tensors) == 1
-            ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
+            assert len(device_from_tensors) == 1, (
+                f"all inputs must be on the same device, found the following devices {device_from_tensors}"
+            )
             self.device = device_from_tensors.pop()
 
         emb = self.backbone(data)
@@ -211,9 +211,9 @@ class HydraModelV2(nn.Module):
             device_from_tensors = {
                 x.device.type for x in data.values() if isinstance(x, torch.Tensor)
             }
-            assert (
-                len(device_from_tensors) == 1
-            ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
+            assert len(device_from_tensors) == 1, (
+                f"all inputs must be on the same device, found the following devices {device_from_tensors}"
+            )
             self.device = device_from_tensors.pop()
 
         emb = self.backbone(data)

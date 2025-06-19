@@ -64,9 +64,9 @@ def get_data(datadir: str, task: str, split: str | None, del_intmd_files: bool) 
     download_link: str | None = None
     if task == "s2ef":
         assert split is not None, "Split must be defined for the s2ef dataset task"
-        assert (
-            split in DOWNLOAD_LINKS_s2ef[task]
-        ), f'S2EF "{split}" split not defined, please specify one of the following: {list(DOWNLOAD_LINKS_s2ef["s2ef"].keys())}'
+        assert split in DOWNLOAD_LINKS_s2ef[task], (
+            f'S2EF "{split}" split not defined, please specify one of the following: {list(DOWNLOAD_LINKS_s2ef["s2ef"].keys())}'
+        )
         download_link = DOWNLOAD_LINKS_s2ef[task][split]
     elif task == "is2re":
         download_link = DOWNLOAD_LINKS_is2re[task]
@@ -130,9 +130,9 @@ def verify_count(output_path: str, task: str, split: str) -> None:
         with open(path) as fp:
             lines = fp.read().splitlines()
         count += len(lines)
-    assert (
-        count == S2EF_COUNTS[task][split]
-    ), f"S2EF {split} count incorrect, verify preprocessing has completed successfully."
+    assert count == S2EF_COUNTS[task][split], (
+        f"S2EF {split} count incorrect, verify preprocessing has completed successfully."
+    )
 
 
 def cleanup(filename: str, dirname: str) -> None:

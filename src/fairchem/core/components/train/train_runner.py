@@ -68,9 +68,9 @@ class TrainCheckpointCallback(Callback):
     def on_train_step_start(self, state: State, unit: TTrainUnit) -> None:
         # We try to save the checkpoint on_train_step_start instead of at the on_train_step_end because both the step and epoch counts are consistently updated before it gets here
         # if we did this at on_train_step_end, the step would be correct but the epoch would have not been incremented and break the edge case on the last step of an epoch
-        assert (
-            self.save_callback
-        ), "Must initialize set_checkpoint_call_backs from Runner!"
+        assert self.save_callback, (
+            "Must initialize set_checkpoint_call_backs from Runner!"
+        )
         step = unit.train_progress.num_steps_completed
         if (
             self.checkpoint_every_n_steps is not None
@@ -89,9 +89,9 @@ class TrainCheckpointCallback(Callback):
     def on_train_end(self, state: State, unit: TTrainUnit) -> None:
         if self.checkpoint_every_n_steps is not None:
             # also always checkpoint on train end
-            assert (
-                self.save_callback
-            ), "Must initialize set_checkpoint_call_backs from Runner!"
+            assert self.save_callback, (
+                "Must initialize set_checkpoint_call_backs from Runner!"
+            )
             self.save_callback(os.path.join(self.checkpoint_dir, "final"))
 
 

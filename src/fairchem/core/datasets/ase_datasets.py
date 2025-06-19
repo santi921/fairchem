@@ -252,7 +252,7 @@ class AseReadDataset(AseAtomsDataset):
             self.relaxed_ase_read_args = copy.deepcopy(self.ase_read_args)
             self.relaxed_ase_read_args["index"] = "-1"
 
-        return list(self.path.glob(f'{config.get("pattern", "*")}'))
+        return list(self.path.glob(f"{config.get('pattern', '*')}"))
 
     def get_atoms(self, idx: str | int) -> ase.Atoms:
         try:
@@ -353,7 +353,7 @@ class AseReadMultiStructureDataset(AseAtomsDataset):
                 f"The specified src is not a directory: {self.config['src']}"
             )
 
-        filenames = list(self.path.glob(f'{config.get("pattern", "*")}'))
+        filenames = list(self.path.glob(f"{config.get('pattern', '*')}"))
 
         ids = []
 
@@ -468,7 +468,7 @@ class AseDBDataset(AseAtomsDataset):
         elif os.path.isfile(config["src"]):
             filepaths = [config["src"]]
         elif os.path.isdir(config["src"]):
-            filepaths = sorted(glob(f'{config["src"]}/*'))
+            filepaths = sorted(glob(f"{config['src']}/*"))
         else:
             filepaths = sorted(glob(config["src"]))
 

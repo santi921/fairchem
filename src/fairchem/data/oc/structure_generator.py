@@ -16,9 +16,10 @@ import time
 import traceback
 
 import numpy as np
+from tqdm import tqdm
+
 from fairchem.data.oc.core import Adsorbate, AdsorbateSlabConfig, Bulk
 from fairchem.data.oc.utils.vasp import write_vasp_input_files
-from tqdm import tqdm
 
 
 class StructureGenerator:

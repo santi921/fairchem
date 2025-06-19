@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+import numpy as np
 import torch
-import numpy as np 
 from torch_scatter import scatter
+
 
 def potential_full_from_edge_inds(
     pos: torch.Tensor,
@@ -44,8 +47,8 @@ def potential_full_from_edge_inds(
 
 
 def heisenberg_potential_full_from_edge_inds(
-    pos: torch.Tensor, 
-    edge_index: torch.Tensor, 
+    pos: torch.Tensor,
+    edge_index: torch.Tensor,
     q: torch.Tensor,
     nn: torch.nn.Module,
     sigma: float = 1.0,
@@ -62,7 +65,7 @@ def heisenberg_potential_full_from_edge_inds(
     Returns:
         potential_dict: dictionary of potential energy for each atom
     """
-    
+
     j, i = edge_index
     distance_vec = pos[j] - pos[i]
     edge_dist = distance_vec.norm(dim=-1).reshape(-1, 1)

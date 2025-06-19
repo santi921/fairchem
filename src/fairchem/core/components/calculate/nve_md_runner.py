@@ -150,9 +150,9 @@ class NVEMDRunner(CalculateRunner):
         Returns:
             list[dict[str, Any]] - List of dictionaries containing calculation results
         """
-        assert num_jobs == len(
-            self.input_data
-        ), "num_jobs must be equal to the number of input data"
+        assert num_jobs == len(self.input_data), (
+            "num_jobs must be equal to the number of input data"
+        )
         atoms, temp = self.input_data[job_num]
         atoms.calc = self.calculator
 

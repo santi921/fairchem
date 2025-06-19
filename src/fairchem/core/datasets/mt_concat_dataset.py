@@ -162,9 +162,9 @@ class ConcatDataset(Dataset[T_co]):
             indv_target_size = max(dataset_sizes)
             return [indv_target_size / size for size in dataset_sizes]
         elif sampling["type"] == "temperature":
-            assert (
-                sampling["temperature"] >= 1.0
-            ), "Temperature must be >= 1.0, for custom weights use weighted sampling."
+            assert sampling["temperature"] >= 1.0, (
+                "Temperature must be >= 1.0, for custom weights use weighted sampling."
+            )
             # total size before expansion
             total_size = sum(dataset_sizes)
             # calc the temperature sampling probabilities for each dataset
@@ -198,9 +198,9 @@ def create_concat_dataset(
     dataset_configs = OmegaConf.to_object(dataset_configs)
     for dataset_name in sorted(dataset_configs.keys()):
         dataset_config = dataset_configs[dataset_name]
-        assert (
-            dataset_config.get("lin_ref", None) is None
-        ), "lin_refs in the dataset config are deprecated, please move them to the task config"
+        assert dataset_config.get("lin_ref", None) is None, (
+            "lin_refs in the dataset config are deprecated, please move them to the task config"
+        )
         for split in dataset_config["splits"]:
             try:
                 datasets[f"{dataset_name}.{split}"] = create_dataset(

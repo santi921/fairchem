@@ -64,7 +64,7 @@ def replace_strings_in_file(file_path, replacements, dry_run):
                 changes_made = True
                 if dry_run:
                     print(
-                        f"Dry run: would replace '{key}' with '{value}' in {file_path} at line {i+1}:"
+                        f"Dry run: would replace '{key}' with '{value}' in {file_path} at line {i + 1}:"
                     )
                     # print(f"  Original line: {line.strip()}")
                     # print(f"  New line: {line.strip().replace(key, value)}")

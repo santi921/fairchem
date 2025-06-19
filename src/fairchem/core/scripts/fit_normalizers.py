@@ -11,14 +11,13 @@ import argparse
 import logging
 from pathlib import Path
 
-from fairchem.experimental.legacy.utils import load_config
-
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import save_checkpoint
 from fairchem.core.modules.normalization.element_references import (
     create_element_references,
 )
 from fairchem.core.modules.normalization.normalizer import fit_normalizers
+from fairchem.experimental.legacy.utils import load_config
 
 
 def fit_norms(

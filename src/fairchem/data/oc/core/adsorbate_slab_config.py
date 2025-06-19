@@ -16,13 +16,15 @@ import numpy as np
 import scipy
 from ase.data import atomic_numbers, covalent_radii
 from ase.geometry import wrap_positions
-from fairchem.data.oc.core.adsorbate import randomly_rotate_adsorbate
 from pymatgen.analysis.adsorption import AdsorbateSiteFinder
 from pymatgen.io.ase import AseAtomsAdaptor
 from scipy.optimize import fsolve
 
+from fairchem.data.oc.core.adsorbate import randomly_rotate_adsorbate
+
 if TYPE_CHECKING:
     import ase
+
     from fairchem.data.oc.core.slab import Adsorbate, Slab
 
 # warnings.filterwarnings("ignore", "The iteration is not making good progress")

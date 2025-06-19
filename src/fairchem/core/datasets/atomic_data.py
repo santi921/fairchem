@@ -254,7 +254,9 @@ class AtomicData:
         # dtype checks
         assert (
             self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype == torch.float
-        ), "Positions, cell, cell_offsets are all expected to be float32. Check data going into AtomicData is correct dtype"
+        ), (
+            "Positions, cell, cell_offsets are all expected to be float32. Check data going into AtomicData is correct dtype"
+        )
         assert self.atomic_numbers.dtype == torch.long
         assert self.edge_index.dtype == torch.long
         assert self.pbc.dtype == torch.bool
@@ -274,10 +276,8 @@ class AtomicData:
             assert self.forces.dtype == torch.float
         if hasattr(self, "stress"):
             # NOTE: usually decomposed. for EFS prediction right now we reshape to (9,). need to discuss, perhaps use (1,3,3)
-            assert (
-                self.stress.dim() == 3
-                and self.stress.shape[1:] == (3, 3)
-                or (self.stress.dim() == 2 and self.stress.shape[1:] == (9,))
+            assert (self.stress.dim() == 3 and self.stress.shape[1:] == (3, 3)) or (
+                self.stress.dim() == 2 and self.stress.shape[1:] == (9,)
             )
             assert self.stress.shape[0] == self.num_graphs
             assert self.stress.dtype == torch.float
@@ -309,9 +309,9 @@ class AtomicData:
         calc = input_atoms.calc
         # TODO: maybe compute a safe cell size if not provided.
         if molecule_cell_size is not None:
-            assert (
-                atoms.cell.volume == 0.0
-            ), "atoms must not have a unit cell to begin with to create a molecule cell"
+            assert atoms.cell.volume == 0.0, (
+                "atoms must not have a unit cell to begin with to create a molecule cell"
+            )
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
@@ -339,12 +339,12 @@ class AtomicData:
 
         # graph construction
         if r_edges:
-            assert (
-                radius is not None
-            ), "cutoff must be specified for cpu graph construction."
-            assert (
-                max_neigh is not None
-            ), "max_neigh must be specified for cpu graph construction."
+            assert radius is not None, (
+                "cutoff must be specified for cpu graph construction."
+            )
+            assert max_neigh is not None, (
+                "max_neigh must be specified for cpu graph construction."
+            )
             split_idx_dist = get_neighbors_pymatgen(atoms, radius, max_neigh)
             edge_index, cell_offsets = reshape_features(*split_idx_dist)
             nedges = torch.tensor([edge_index.shape[1]], dtype=torch.long)
@@ -491,9 +491,9 @@ class AtomicData:
     @classmethod
     def from_dict(cls, dictionary):
         r"""Creates a data object from a python dictionary."""
-        assert set(_REQUIRED_KEYS).issubset(
-            dictionary.keys()
-        ), f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
+        assert set(_REQUIRED_KEYS).issubset(dictionary.keys()), (
+            f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
+        )
 
         data = cls(
             pos=dictionary["pos"],
@@ -808,9 +808,9 @@ def atomicdata_list_to_batch(
     natoms_list = []
     sid_list = []
     for i, data in enumerate(data_list):
-        assert (
-            data.num_graphs == 1
-        ), "data list must only contain single-graph AtomicData objects."
+        assert data.num_graphs == 1, (
+            "data list must only contain single-graph AtomicData objects."
+        )
 
         for key in keys:
             item = data[key]

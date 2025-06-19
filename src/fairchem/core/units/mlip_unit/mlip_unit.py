@@ -11,11 +11,12 @@ import logging
 import os
 import random
 import time
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 import hydra
 import numpy as np
@@ -50,10 +51,10 @@ from fairchem.core.common.logger import WandBSingletonLogger
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import load_state_dict, match_state_dict
 from fairchem.core.datasets.collaters.mt_collater import MTCollater
-from fairchem.core.modules.normalization.element_references import (  # noqa: TCH001
+from fairchem.core.modules.normalization.element_references import (  # noqa: TC001
     ElementReferences,
 )
-from fairchem.core.modules.normalization.normalizer import Normalizer  # noqa: TCH001
+from fairchem.core.modules.normalization.normalizer import Normalizer  # noqa: TC001
 from fairchem.core.modules.scheduler import CosineLRLambda
 from fairchem.core.units.mlip_unit._metrics import Metrics, get_metrics_fn
 from fairchem.core.units.mlip_unit.api.inference import (
@@ -173,9 +174,9 @@ def initialize_finetuning_model(
     del model.output_heads
     model.output_heads = {}
     head_names_sorted = sorted(heads.keys())
-    assert len(set(head_names_sorted)) == len(
-        head_names_sorted
-    ), "Head names must be unique!"
+    assert len(set(head_names_sorted)) == len(head_names_sorted), (
+        "Head names must be unique!"
+    )
     for head_name in head_names_sorted:
         head_config = heads[head_name]
         if "module" not in head_config:
@@ -366,9 +367,9 @@ def compute_metrics(
     #     # this will cause downstream broadcast operations to be wrong and is dangerous
     #     target_masked = target_masked.view(output_size, -1)
 
-    assert (
-        target_masked.shape == pred_masked.shape
-    ), f"shape mismatch for {task} target: target: {target_masked.shape}, pred: {pred_masked.shape}"
+    assert target_masked.shape == pred_masked.shape, (
+        f"shape mismatch for {task} target: target: {target_masked.shape}, pred: {pred_masked.shape}"
+    )
 
     # TODO need a cleaner interface for this...
     # Lets package up the masked target and prediction into a dictionary,
@@ -417,9 +418,9 @@ def _get_consine_lr_scheduler(
     epochs: Optional[int] = None,
     steps: Optional[int] = None,
 ) -> torch.optim.lr_scheduler.LRScheduler:
-    assert (epochs is not None) ^ (
-        steps is not None
-    ), "Exactly one of epochs or steps must be None/Not-None (XOR)"
+    assert (epochs is not None) ^ (steps is not None), (
+        "Exactly one of epochs or steps must be None/Not-None (XOR)"
+    )
     scheduler_steps = int(epochs * n_iters_per_epoch) if steps is None else steps
     # fixed function for constructing a LambdaLR scheduler
     lambda_fn = CosineLRLambda(
@@ -972,9 +973,9 @@ class MLIPPredictUnit(PredictUnit[Batch]):
             # merge everything on CPU
             if self.inference_mode.merge_mole:
                 # replace backbone with non MOE version
-                assert (
-                    data.natoms.numel() == 1
-                ), f"Cannot merge model with multiple systems in batch. Must be exactly 1 system, found {data.natoms.numel()}"
+                assert data.natoms.numel() == 1, (
+                    f"Cannot merge model with multiple systems in batch. Must be exactly 1 system, found {data.natoms.numel()}"
+                )
                 self.model.module.backbone = (
                     self.model.module.backbone.merge_MOLE_model(data.clone())
                 )
@@ -996,21 +997,21 @@ class MLIPPredictUnit(PredictUnit[Batch]):
                 self.merged_on = self.get_composition_charge_spin_dataset(data_device)
             else:
                 this_sys = self.get_composition_charge_spin_dataset(data_device)
-                assert (
-                    data_device.natoms.numel() == 1
-                ), f"Cannot run merged model on batch with multiple systems. Must be exactly 1 system, found {data_device.natoms.numel()}"
-                assert (
-                    self.merged_on[0][0].isclose(this_sys[0][0], rtol=1e-5).all()
-                ), "Cannot run on merged model on system. Embeddings seem different..."
-                assert (
-                    self.merged_on[0][1] == this_sys[0][1]
-                ), f"Cannot run on merged model on system. Charge is diferrent {self.merged_on[0][1]} vs {this_sys[0][1]}"
-                assert (
-                    self.merged_on[0][2] == this_sys[0][2]
-                ), f"Cannot run on merged model on system. Spin is diferrent {self.merged_on[0][2]} vs {this_sys[0][2]}"
-                assert (
-                    self.merged_on[1] == this_sys[1]
-                ), f"Cannot run on merged model on system. Dataset is diferrent {self.merged_on[1]} vs {this_sys[1]}"
+                assert data_device.natoms.numel() == 1, (
+                    f"Cannot run merged model on batch with multiple systems. Must be exactly 1 system, found {data_device.natoms.numel()}"
+                )
+                assert self.merged_on[0][0].isclose(this_sys[0][0], rtol=1e-5).all(), (
+                    "Cannot run on merged model on system. Embeddings seem different..."
+                )
+                assert self.merged_on[0][1] == this_sys[0][1], (
+                    f"Cannot run on merged model on system. Charge is diferrent {self.merged_on[0][1]} vs {this_sys[0][1]}"
+                )
+                assert self.merged_on[0][2] == this_sys[0][2], (
+                    f"Cannot run on merged model on system. Spin is diferrent {self.merged_on[0][2]} vs {this_sys[0][2]}"
+                )
+                assert self.merged_on[1] == this_sys[1], (
+                    f"Cannot run on merged model on system. Dataset is diferrent {self.merged_on[1]} vs {this_sys[1]}"
+                )
 
         inference_context = torch.no_grad() if self.direct_forces else nullcontext()
         tf32_context = (

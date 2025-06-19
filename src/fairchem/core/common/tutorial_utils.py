@@ -67,7 +67,7 @@ def describe_fairchem():
     print(f"  Processor: {platform.processor()}")
     print(f"  Virtual memory: {psutil.virtual_memory()}")
     print(f"  Swap memory: {psutil.swap_memory()}")
-    print(f'  Disk usage: {psutil.disk_usage("/")}')
+    print(f"  Disk usage: {psutil.disk_usage('/')}")
 
 
 def train_test_val_split(

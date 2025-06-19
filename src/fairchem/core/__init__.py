@@ -19,4 +19,4 @@ except PackageNotFoundError:
     # package is not installed
     __version__ = ""
 
-__all__ = ["FAIRChemCalculator", "pretrained_mlip", "clear_cache"]
+__all__ = ["FAIRChemCalculator", "clear_cache", "pretrained_mlip"]

@@ -267,9 +267,9 @@ def fit_linear_references(
         enumerate(data_loader), total=num_batches, desc="Fitting linear references"
     ):
         if i == 0:
-            assert all(
-                len(batch[target].squeeze().shape) == 1 for target in targets
-            ), "element references can only be used for scalar targets"
+            assert all(len(batch[target].squeeze().shape) == 1 for target in targets), (
+                "element references can only be used for scalar targets"
+            )
         elif i == num_batches:
             break
 

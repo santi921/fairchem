@@ -128,9 +128,9 @@ def setup(config) -> None:
                 pass
     else:  # local mode
         if "MASTER_ADDR" not in os.environ:
-            assert (
-                config["world_size"] == 1
-            ), "Can only setup master address and port at this point for a single rank, otherwise we assume the processes and the comm addr/port have already been setup"
+            assert config["world_size"] == 1, (
+                "Can only setup master address and port at this point for a single rank, otherwise we assume the processes and the comm addr/port have already been setup"
+            )
             setup_env_local()
         local_rank = int(os.environ["LOCAL_RANK"])
         assign_device_for_local_rank(config["cpu"], local_rank)

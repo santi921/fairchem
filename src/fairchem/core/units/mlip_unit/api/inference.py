@@ -137,9 +137,9 @@ NAME_TO_INFERENCE_SETTING = {
 
 def guess_inference_settings(settings: str | InferenceSettings):
     if isinstance(settings, str):
-        assert (
-            settings in NAME_TO_INFERENCE_SETTING
-        ), f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
+        assert settings in NAME_TO_INFERENCE_SETTING, (
+            f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
+        )
         return NAME_TO_INFERENCE_SETTING[settings]
     elif isinstance(settings, InferenceSettings):
         return settings

@@ -164,7 +164,7 @@ class eSCNMDMoeBackboneLR(eSCNMDBackboneLR, MOLEInterface):
         with torch.no_grad():
             if self.counter % 500 == 0:
                 logging.info(
-                    f"{self.counter }: Expert variance: "
+                    f"{self.counter}: Expert variance: "
                     + ",".join(
                         [
                             f"{x:.2e}"
@@ -175,7 +175,7 @@ class eSCNMDMoeBackboneLR(eSCNMDBackboneLR, MOLEInterface):
                     )
                 )
                 logging.info(
-                    f"{self.counter }: Expert mean: "
+                    f"{self.counter}: Expert mean: "
                     + ",".join(
                         [
                             f"{x:.2e}"
@@ -313,7 +313,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         with torch.no_grad():
             if self.counter % 500 == 0:
                 logging.info(
-                    f"{self.counter }: Expert variance: "
+                    f"{self.counter}: Expert variance: "
                     + ",".join(
                         [
                             f"{x:.2e}"
@@ -324,7 +324,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
                     )
                 )
                 logging.info(
-                    f"{self.counter }: Expert mean: "
+                    f"{self.counter}: Expert mean: "
                     + ",".join(
                         [
                             f"{x:.2e}"

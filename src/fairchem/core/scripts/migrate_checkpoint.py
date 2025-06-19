@@ -99,9 +99,9 @@ def migrate_checkpoint(
                 datasets_with_stress.add(task.name.replace("_stress", ""))
                 if task.name == target_stress_task:
                     target_stress_config = task
-        assert (
-            target_stress_config is not None
-        ), f"Did not find existing task {target_stress_task} in {[task.name for task in checkpoint.tasks_config]}"
+        assert target_stress_config is not None, (
+            f"Did not find existing task {target_stress_task} in {[task.name for task in checkpoint.tasks_config]}"
+        )
         # copy over the task configs to tasks that dont have stress
         for dataset_name in output_dataset_names - datasets_with_stress:
             task_config = target_stress_config.copy()

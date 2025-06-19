@@ -140,9 +140,9 @@ def replace_linear_with_MOLE(
         return cache[layer_identifier]
 
     if mole_layer_type == "dgl":
-        assert (
-            fairchem_cpp_found
-        ), "Cannot use DGL layer type if fairchem_cpp package is not available"
+        assert fairchem_cpp_found, (
+            "Cannot use DGL layer type if fairchem_cpp package is not available"
+        )
         layer = MOLEDGL(
             num_experts=num_experts,
             global_mole_tensors=global_mole_tensors,

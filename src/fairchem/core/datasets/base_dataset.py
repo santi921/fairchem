@@ -94,12 +94,12 @@ class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
             for field in metadata_npzs[0]
         }
 
-        assert np.issubdtype(
-            metadata["natoms"].dtype, np.integer
-        ), f"Metadata natoms must be an integer type! not {metadata['natoms'].dtype}"
-        assert metadata["natoms"].shape[0] == len(
-            self
-        ), "Loaded metadata and dataset size mismatch."
+        assert np.issubdtype(metadata["natoms"].dtype, np.integer), (
+            f"Metadata natoms must be an integer type! not {metadata['natoms'].dtype}"
+        )
+        assert metadata["natoms"].shape[0] == len(self), (
+            "Loaded metadata and dataset size mismatch."
+        )
 
         return metadata
 

@@ -155,12 +155,12 @@ def omol_transform(data_object: AtomicData, config) -> AtomicData:
     data_object.atomic_numbers = atomic_numbers
     data_object.pos = positions
     data_object.cell = cell
-    assert hasattr(
-        data_object, "charge"
-    ), "no charge in omol dataset set a2g_args: {r_energy: True, r_forces: True, r_data_keys: ['spin', 'charge']}"
-    assert hasattr(
-        data_object, "spin"
-    ), "no spin in omol dataset set a2g_args: {r_energy: True, r_forces: True, r_data_keys: ['spin', 'charge']}"
+    assert hasattr(data_object, "charge"), (
+        "no charge in omol dataset set a2g_args: {r_energy: True, r_forces: True, r_data_keys: ['spin', 'charge']}"
+    )
+    assert hasattr(data_object, "spin"), (
+        "no spin in omol dataset set a2g_args: {r_energy: True, r_forces: True, r_data_keys: ['spin', 'charge']}"
+    )
 
     # add fixed
     data_object.fixed = torch.zeros(data_object.natoms, dtype=torch.float)

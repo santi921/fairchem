@@ -73,9 +73,9 @@ class DDPMTLoss(nn.Module):
             "per_structure": self.per_structure,
         }
         self.coefficient = coefficient
-        assert self.reduction in list(
-            self.reduction_map.keys()
-        ), "Reduction must be one of: 'mean', 'sum', 'per_structure'"
+        assert self.reduction in list(self.reduction_map.keys()), (
+            "Reduction must be one of: 'mean', 'sum', 'per_structure'"
+        )
 
     def sum(self, input, mult_mask, num_samples, loss, natoms):
         # this sum will reduce the loss down to a single scalar
@@ -142,9 +142,9 @@ class DDPMTLoss(nn.Module):
         natoms: torch.Tensor,
     ):
         # ensure torch doesn't do any unwanted broadcasting
-        assert (
-            input.shape[0] == target.shape[0] == mult_mask.shape[0]
-        ), f"Mismatched shapes: {input.shape} and {target.shape} and {mult_mask.shape}"
+        assert input.shape[0] == target.shape[0] == mult_mask.shape[0], (
+            f"Mismatched shapes: {input.shape} and {target.shape} and {mult_mask.shape}"
+        )
 
         # Ensure torch doesn't do any unwanted broadcasting
         target = target.view(input.shape)
@@ -292,9 +292,9 @@ class DDPLoss(nn.Module):
             "mean": self.mean,
             "sum": self.sum,
         }
-        assert self.reduction in list(
-            self.reduction_map.keys()
-        ), "Reduction must be one of: 'mean', 'sum'"
+        assert self.reduction in list(self.reduction_map.keys()), (
+            "Reduction must be one of: 'mean', 'sum'"
+        )
 
     def sum(self, input, loss, natoms):
         # this sum will reduce the loss down to a single scalar
@@ -327,9 +327,9 @@ class DDPLoss(nn.Module):
         natoms: torch.Tensor,
     ):
         # ensure torch doesn't do any unwanted broadcasting
-        assert (
-            input.shape == target.shape
-        ), f"Mismatched shapes: {input.shape} and {target.shape}"
+        assert input.shape == target.shape, (
+            f"Mismatched shapes: {input.shape} and {target.shape}"
+        )
 
         # zero out nans, if any
         found_nans_or_infs = not torch.all(input.isfinite())

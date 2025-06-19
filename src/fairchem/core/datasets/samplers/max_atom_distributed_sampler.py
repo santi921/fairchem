@@ -10,7 +10,8 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Iterator
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import numba as nb
 import numpy as np
@@ -123,9 +124,9 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         assert self.rank < self.num_replicas
 
         if gp_utils.initialized():
-            assert (
-                min_atoms >= gp_utils.get_gp_world_size()
-            ), "Min atoms needs to be at least gp world size!"
+            assert min_atoms >= gp_utils.get_gp_world_size(), (
+                "Min atoms needs to be at least gp world size!"
+            )
 
         self.seed = seed
         self.shuffle = shuffle
@@ -148,9 +149,9 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         else:
             self.num_samples = math.ceil(len(self.all_batches) / self.num_replicas)
         self.total_size = self.num_samples * self.num_replicas
-        assert (
-            len(self.all_batches) >= self.num_replicas
-        ), "there are less batches than ranks!"
+        assert len(self.all_batches) >= self.num_replicas, (
+            "there are less batches than ranks!"
+        )
 
     def _prepare_batches(self) -> list[int]:
         # shuffle is not optional here since the metadata tend to be sorted by atom count and the resulting batches will be highly uneven
@@ -207,9 +208,9 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         assert len(indices) == self.num_samples
         # slice of batch indices
         batch_slice = [self.all_batches[i] for i in indices]
-        assert (
-            self.start_iter < len(batch_slice)
-        ), f"starting iteration {self.start_iter} must be less than size of the slice of batches! {len(batch_slice)}"
+        assert self.start_iter < len(batch_slice), (
+            f"starting iteration {self.start_iter} must be less than size of the slice of batches! {len(batch_slice)}"
+        )
         return iter(batch_slice[self.start_iter :])
 
     def set_epoch_and_start_iteration(self, epoch: int, start_iter: int) -> None:

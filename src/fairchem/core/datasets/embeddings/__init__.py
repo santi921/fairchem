@@ -9,8 +9,8 @@ from __future__ import annotations
 
 __all__ = [
     "ATOMIC_RADII",
-    "KHOT_EMBEDDINGS",
     "CONTINUOUS_EMBEDDINGS",
+    "KHOT_EMBEDDINGS",
     "QMOF_KHOT_EMBEDDINGS",
 ]
 
