@@ -55,11 +55,7 @@ if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
 
 
-<<<<<<< HEAD
-ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_ACTIVATION_CHECKPOINT_CHUNK_SIZE = 1024 * 128
-=======
 ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE = 1024 * 128
->>>>>>> a0a984b7ebc5eb00aacf6850eaf044d33078db1f
 
 
 def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
@@ -104,8 +100,6 @@ def pad_edges(graph_dict, edge_chunk_size: int, cutoff: float):
         # is a multiple of edge_chunk_size (or at least one edge), aiding chunked
         # activation checkpointing and avoiding empty tensor edge cases.
         add_n_empty_edges(graph_dict, n_edges_post - n_edges, cutoff)
-<<<<<<< HEAD
-
 
 def compose_tensor(
     trace: torch.Tensor,
@@ -229,8 +223,50 @@ def compose_tensor(
         decomposed_preds,
     )
     return r2_tensor
-=======
->>>>>>> a0a984b7ebc5eb00aacf6850eaf044d33078db1f
+
+
+def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
+    graph_dict["edge_index"] = torch.cat(
+        (
+            graph_dict["edge_index"].new_ones(2, edges_to_add)
+            * graph_dict["node_offset"],
+            graph_dict["edge_index"],
+        ),
+        dim=1,
+    )
+
+    self_edge_distance_vec = graph_dict["edge_distance_vec"].new_ones(1, 3) + cutoff
+    graph_dict["edge_distance_vec"] = torch.cat(
+        (
+            self_edge_distance_vec.expand(edges_to_add, 3),
+            graph_dict["edge_distance_vec"],
+        ),
+        dim=0,
+    )
+
+    edge_distance = torch.linalg.norm(self_edge_distance_vec, dim=-1, keepdim=False)
+    graph_dict["edge_distance"] = torch.cat(
+        (edge_distance.expand(edges_to_add), graph_dict["edge_distance"]), dim=0
+    )
+
+
+@torch.compiler.disable
+def pad_edges(graph_dict, edge_chunk_size: int, cutoff: float):
+    n_edges = n_edges_post = graph_dict["edge_index"].shape[1]
+
+    if edge_chunk_size > 0 and n_edges_post % edge_chunk_size != 0:
+        # make sure we have a multiple of self.edge_chunk_size edges
+        n_edges_post += edge_chunk_size - n_edges_post % edge_chunk_size
+
+    n_edges_post = max(n_edges_post, 1)  # at least 1 edge to avoid empty "edge" case
+    if n_edges_post > n_edges:
+        # We append synthetic padding edges whose distance vector has norm > cutoff
+        # (see add_n_empty_edges where distance_vec is set to 1+cutoff). The radial
+        # polynomial envelope returns 0 for distances >= cutoff, so these edges never
+        # contribute to embeddings or message passing; they only ensure the edge count
+        # is a multiple of edge_chunk_size (or at least one edge), aiding chunked
+        # activation checkpointing and avoiding empty tensor edge cases.
+        add_n_empty_edges(graph_dict, n_edges_post - n_edges, cutoff)
 
 
 @registry.register_model("escnmd_backbone")
@@ -743,6 +779,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             edge_partition
         ]
         return graph_dict
+
 
     @property
     def num_params(self) -> int:
@@ -1416,7 +1453,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         activation_checkpoint_chunk_size = None
         if activation_checkpointing:
             # The size of edge blocks to use in activation checkpointing
-            activation_checkpoint_chunk_size = ESCNMD_DEFAULT_EDGE_CHUNK_SIZE
+            activation_checkpoint_chunk_size = ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE
 
         # related to charge spin dataset system embedding
         self.chg_spin_emb_type = chg_spin_emb_type
@@ -2651,13 +2688,11 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
 
         outputs[energy_key] = {"energy": energy} if self.wrap_property else energy
 
-        embeddings = emb["node_embedding"].detach()
-        if gp_utils.initialized():
-            embeddings = gp_utils.gather_from_model_parallel_region(embeddings, dim=0)
-
-        outputs["embeddings"] = (
-            {"embeddings": embeddings} if self.wrap_property else embeddings
-        )
+        if not gp_utils.initialized():
+            embeddings = emb["node_embedding"].detach()
+            outputs["embeddings"] = (
+                {"embeddings": embeddings} if self.wrap_property else embeddings
+            )
 
         if self.regress_stress:
             grads = torch.autograd.grad(
