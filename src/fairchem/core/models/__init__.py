@@ -11,59 +11,26 @@ import torch
 
 from .uma.escn_md import (
     MLP_EFS_Head,
-    MLP_EFS_Head_LR,
     MLP_Energy_Head,
-    MLP_Energy_Head_LR,
     MLP_Stress_Head,
     eSCNMDBackbone,
+)
+from .uma.escn_md_lr import (
+    MLP_EFS_Head_LR,
+    MLP_Energy_Head_LR,
+    Linear_Energy_Head_LR,
     eSCNMDBackboneLR,
 )
 
-# REMOVE LATER
-from .allscaip import (
-    AllScAIPBackbone,
-    AllScAIPEnergyHead,
-    AllScAIPDirectForceHead,
-    AllScAIPGradientEnergyForceStressHead,
-    AllScAIPEnergyHeadLR,
-    AllScAIPGradientEnergyForceStressHeadLR
-)
-
-
-from .escaip import (
-    EScAIPBackbone,
-    EScAIPEnergyHead,
-    EScAIPDirectForceHead,
-    EScAIPGradientEFSHead
-)
-
-
-from .uma.escn_moe import eSCNMDMoeBackbone, eSCNMDMoeBackboneLR
-
-from .uma.escn_md_les import eSCNMDBackboneLES, MLP_EFS_Head_LES, MLP_Energy_Head_LES
 torch.set_float32_matmul_precision("high")
 
 __all__ = [
+    "MLP_EFS_Head",
     "MLP_EFS_Head_LR",
     "MLP_Energy_Head",
     "MLP_Energy_Head_LR",
     "MLP_Stress_Head",
-    "MLP_Stress_Head_LR",
+    "Linear_Energy_Head_LR",
     "eSCNMDBackbone",
     "eSCNMDBackboneLR",
-    "MLP_EFS_Head",
-    "eSCNMDMoeBackbone",
-    "eSCNMDMoeBackboneLR",
-    "EScAIPBackbone",
-    "EScAIPEnergyHead",
-    "EScAIPDirectForceHead",
-    "EScAIPGradientEFSHead",
-    "eSCNMDBackboneLES",
-    "MLP_EFS_Head_LES",
-    "AllScAIPBackbone",
-    "AllScAIPEnergyHead",
-    "AllScAIPDirectForceHead",
-    "AllScAIPGradientEnergyForceStressHead", 
-    "AllScAIPEnergyHeadLR",
-    "AllScAIPGradientEnergyForceStressHeadLR"
 ]

@@ -111,7 +111,8 @@ This section documents what changed structurally in the eSCNMD backbone and head
 | `use_quaternion_wigner` | `bool` | `True` | New quaternion-based Wigner D method (fixes y-aligned edge edge case) |
 | `charge_balanced_channels` | `list[int]\|None` | `None` | Which embedding channels to charge-balance |
 | `spin_balanced_channels` | `list[int]\|None` | `None` | Which embedding channels to spin-balance |
-| `execution_mode` | `str` | `"general"` | Dispatch to Triton/fast backends |
+| `execution_mode` | `str`
+ | `"general"` | Dispatch to Triton/fast backends |
 
 **Removed parameters:**
 - `edge_chunk_size: int | None = None` → now `edge_chunk_size: int = 1` (always set, auto-computed)

@@ -9,22 +9,17 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import Counter
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from ase.calculators.calculator import Calculator
+from ase.calculators.calculator import Calculator, PropertyNotImplementedError
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from fairchem.core.calculate import pretrained_mlip
-from fairchem.core.datasets import data_list_collater
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.units.mlip_unit.api.inference import (
-    CHARGE_RANGE,
-    DEFAULT_CHARGE,
-    DEFAULT_SPIN,
-    DEFAULT_SPIN_OMOL,
-    SPIN_RANGE,
     InferenceSettings,
     UMATask,
 )
@@ -72,12 +67,13 @@ class FAIRChemCalculator(Calculator):
 
         valid_datasets = list(predict_unit.dataset_to_tasks.keys())
         if task_name is not None:
-            assert (
-                task_name in valid_datasets
-            ), f"Given: {task_name}, Valid options are {valid_datasets}"
-            self._task = UMATask(task_name)
+            if task_name not in valid_datasets:
+                raise ValueError(
+                    f"Invalid task_name '{task_name}'. Valid options are {valid_datasets}"
+                )
+            self._task_name = task_name
         elif len(valid_datasets) == 1:
-            self._task = UMATask(valid_datasets[0])
+            self._task_name = valid_datasets[0]
         else:
             raise RuntimeError(
                 f"A task name must be provided. Valid options are {valid_datasets}"
@@ -105,18 +101,20 @@ class FAIRChemCalculator(Calculator):
             max_neigh = None
             radius = 6.0  # Still need radius even for internal graph gen
 
-        self.a2g = partial(
-            AtomicData.from_ase,
-            task_name=self.task_name,
-            r_edges=r_edges,
-            r_data_keys=["spin", "charge"],
-            max_neigh=max_neigh,
-            radius=radius,
-        )
+        a2g_kwargs = {
+            "task_name": self.task_name,
+            "r_edges": r_edges,
+            "r_data_keys": ["spin", "charge"],
+            "max_neigh": max_neigh,
+            "radius": radius,
+            "target_dtype": predict_unit.inference_settings.base_precision_dtype,
+        }
+
+        self.a2g = partial(AtomicData.from_ase, **a2g_kwargs)
 
     @property
     def task_name(self) -> str:
-        return self._task.value
+        return self._task_name
 
     @classmethod
     def from_model_checkpoint(
@@ -127,6 +125,7 @@ class FAIRChemCalculator(Calculator):
         overrides: dict | None = None,
         device: Literal["cuda", "cpu"] | None = None,
         seed: int = 41,
+        workers: int = 1,
     ) -> FAIRChemCalculator:
         """Instantiate a FAIRChemCalculator from a checkpoint file.
 
@@ -141,6 +140,7 @@ class FAIRChemCalculator(Calculator):
             overrides: Optional dictionary of settings to override default inference settings.
             device: Optional torch device to load the model onto.
             seed: Random seed for reproducibility.
+            workers: Number of parallel workers for prediction unit. Default is 1.
         """
 
         if name_or_path in pretrained_mlip.available_models:
@@ -149,6 +149,7 @@ class FAIRChemCalculator(Calculator):
                 inference_settings=inference_settings,
                 overrides=overrides,
                 device=device,
+                workers=workers,
             )
         elif os.path.isfile(name_or_path):
             predict_unit = pretrained_mlip.load_predict_unit(
@@ -156,6 +157,7 @@ class FAIRChemCalculator(Calculator):
                 inference_settings=inference_settings,
                 overrides=overrides,
                 device=device,
+                workers=workers,
             )
         else:
             raise ValueError(
@@ -178,6 +180,22 @@ class FAIRChemCalculator(Calculator):
         if (not state) and (self.atoms.info != atoms.info):
             state.append("info")
         return state
+
+    def get_property(self, name, atoms=None, allow_calculation=True):
+        try:
+            result = super().get_property(
+                name, atoms=atoms, allow_calculation=allow_calculation
+            )
+        except PropertyNotImplementedError as exc:
+            msg = str(exc)
+            if name in ("forces", "stress", "hessian"):
+                msg += (
+                    f"\n {name} prediction can be enabled by setting `predict_untrained_{name}=set('{self.task_name}')` "
+                    f"in the InferenceSettings."
+                )
+            raise PropertyNotImplementedError(msg) from exc
+
+        return result
 
     def calculate(
         self, atoms: Atoms, properties: list[str], system_changes: list[str]
@@ -206,68 +224,37 @@ class FAIRChemCalculator(Calculator):
         # Check if the atoms object has periodic boundary conditions (PBC) set correctly
         self._check_atoms_pbc(atoms)
 
-        # Validate that charge/spin are set correctly for omol, or default to 0 otherwise
-        self._validate_charge_and_spin(atoms)
+        # Validate input data
+        self.predictor.validate_atoms_data(atoms, self.task_name)
 
         # Standard call to check system_changes etc
         Calculator.calculate(self, atoms, properties, system_changes)
 
-        if len(atoms) == 1 and sum(atoms.pbc) == 0:
-            self.results = self._get_single_atom_energies(atoms)
-        else:
-            # Convert using the current a2g object
-            data_object = self.a2g(atoms)
+        # Convert using the current a2g object
+        data = self.a2g(atoms)
 
-            # Batch and predict
-            batch = data_list_collater([data_object], otf_graph=True)
-            pred = self.predictor.predict(batch)
+        # Batch and predict
+        pred = self.predictor.predict(data)
 
-            # Collect the results into self.results
-            self.results = {}
-            for calc_key in self.implemented_properties:
-                if calc_key == "energy":
-                    energy = float(pred[calc_key].detach().cpu().numpy()[0])
+        # Collect the results into self.results
+        self.results = {}
+        for calc_key in self.implemented_properties:
+            if calc_key == "energy":
+                energy = float(pred[calc_key].detach().cpu().numpy()[0])
 
-                    self.results["energy"] = self.results["free_energy"] = (
-                        energy  # Free energy is a copy of energy
-                    )
-                if calc_key == "forces":
-                    forces = pred[calc_key].detach().cpu().numpy()
-                    self.results["forces"] = forces
-                if calc_key == "stress":
-                    stress = pred[calc_key].detach().cpu().numpy().reshape(3, 3)
-                    stress_voigt = full_3x3_to_voigt_6_stress(stress)
-                    self.results["stress"] = stress_voigt
-
-    def _get_single_atom_energies(self, atoms) -> dict:
-        """
-        Populate output with single atom energies
-        """
-        if self.predictor.atom_refs is None:
-            raise ValueError(
-                "Single atom system but no atomic references present. "
-                "Please call fairchem.core.pretrained_mlip.get_predict_unit() "
-                "with an appropriate checkpoint name."
-            )
-        logging.warning(
-            "Single atom systems are not handled by the model; "
-            "the precomputed DFT result is returned. "
-            "Spin multiplicity is ignored for monoatomic systems."
-        )
-        elt = atoms.get_atomic_numbers()[0]
-        results = {}
-
-        atom_refs = self.predictor.atom_refs[self.task_name]
-        try:
-            energy = atom_refs.get(int(elt), {}).get(atoms.info["charge"])
-        except AttributeError:
-            energy = atom_refs[int(elt)]
-        if energy is None:
-            raise ValueError("This model has not stored this element with this charge.")
-        results["energy"] = energy
-        results["forces"] = np.array([[0.0] * 3])
-        results["stress"] = np.array([0.0] * 6)
-        return results
+                self.results["energy"] = self.results["free_energy"] = (
+                    energy  # Free energy is a copy of energy
+                )
+            if calc_key == "forces":
+                forces = pred[calc_key].detach().cpu().numpy()
+                self.results["forces"] = forces
+            if calc_key == "stress":
+                stress = pred[calc_key].detach().cpu().numpy().reshape(3, 3)
+                stress_voigt = full_3x3_to_voigt_6_stress(stress)
+                self.results["stress"] = stress_voigt
+            if calc_key == "hessian":
+                hessian = pred[calc_key].detach().cpu().numpy().squeeze()
+                self.results["hessian"] = hessian
 
     def _check_atoms_pbc(self, atoms) -> None:
         """
@@ -281,53 +268,118 @@ class FAIRChemCalculator(Calculator):
         if np.any(atoms.pbc) and not np.all(atoms.pbc):
             raise MixedPBCError
 
-    def _validate_charge_and_spin(self, atoms: Atoms) -> None:
+
+class FormationEnergyCalculator(Calculator):
+    def __init__(
+        self,
+        calculator: Calculator,
+        element_references: dict | None = None,
+        apply_corrections: bool | None = None,
+        correction_type: Literal["MP2020", "OMat24"] = "OMat24",
+    ):
         """
-        Validate and set default values for charge and spin.
+        A calculator wrapper that computes formation energies. Assumes task naming matches UMA.
 
         Args:
-            atoms (Atoms): The atomic structure containing charge and spin information.
+            calculator (Calculator): The base calculator to wrap.
+            element_references (dict, optional): Dictionary of formation reference energies for each element.
+                If None and calculator is FAIRChemCalculator, uses default references from the predictor.
+            apply_corrections (bool, optional): Whether to apply MP style corrections to formation energies.
+                Only relevant for OMat task. Defaults to True for OMat task if calculator is FAIRChemCalculator.
+            correction_type (Literal["MP2020", "OMat24"], optional): Type of corrections to apply. Defaults to "OMat24".
         """
+        super().__init__()
+        self.calculator = calculator
 
-        if "charge" not in atoms.info:
-            if self.task_name == UMATask.OMOL.value:
-                logging.warning(
-                    "task_name='omol' detected, but charge is not set in atoms.info. Defaulting to charge=0. "
-                    "Ensure charge is an integer representing the total charge on the system and is within the range -100 to 100."
-                )
-            atoms.info["charge"] = DEFAULT_CHARGE
-
-        if "spin" not in atoms.info:
-            if self.task_name == UMATask.OMOL.value:
-                atoms.info["spin"] = DEFAULT_SPIN_OMOL
-                logging.warning(
-                    "task_name='omol' detected, but spin multiplicity is not set in atoms.info. Defaulting to spin=1. "
-                    "Ensure spin is an integer representing the spin multiplicity from 0 to 100."
-                )
+        if element_references is None:
+            if isinstance(calculator, FAIRChemCalculator):
+                element_references = calculator.predictor.form_elem_refs[
+                    calculator.task_name
+                ]
             else:
-                atoms.info["spin"] = DEFAULT_SPIN
+                raise ValueError("element_references must be provided")
+        self.element_references = element_references
 
-        # Validate charge
-        charge = atoms.info["charge"]
-        if not isinstance(charge, (int, np.integer)):
-            raise TypeError(
-                f"Invalid type for charge: {type(charge)}. Charge must be an integer representing the total charge on the system."
+        if apply_corrections is True:
+            if isinstance(calculator, FAIRChemCalculator):
+                if calculator.task_name != UMATask.OMAT.value:
+                    raise ValueError(
+                        "MP style corrections can only be applied for the OMat task."
+                    )
+            else:
+                logging.warning(
+                    "apply_corrections=True specified for non-FAIRChemCalculator. "
+                    "Corrections will be attempted."
+                )
+
+        if (
+            apply_corrections is None
+            and isinstance(calculator, FAIRChemCalculator)
+            and calculator.task_name == UMATask.OMAT.value
+        ):
+            apply_corrections = True
+
+        self.apply_corrections = (
+            apply_corrections if apply_corrections is not None else False
+        )
+        self._correction_type = correction_type
+
+        if hasattr(calculator, "implemented_properties"):
+            self.implemented_properties = calculator.implemented_properties
+
+    def calculate(
+        self, atoms: Atoms, properties: list[str], system_changes: list[str]
+    ) -> None:
+        """
+        Calculate formation energy by wrapping the base calculator.
+
+        Args:
+            atoms (Atoms): The atomic structure to calculate properties for.
+            properties (list[str]): The list of properties to calculate.
+            system_changes (list[str]): The list of changes in the system.
+        """
+        self.calculator.calculate(atoms, properties, system_changes)
+
+        self.results = self.calculator.results.copy()
+
+        if "energy" in self.results:
+            total_energy = self.results["energy"]
+
+            if self.apply_corrections:
+                try:
+                    from fairchem.data.omat.entries.compatibility import (
+                        apply_mp_style_corrections,
+                    )
+                except ImportError as err:
+                    raise ImportError(
+                        "fairchem.data.omat is required to apply MP style corrections. Please install it."
+                    ) from err
+                total_energy = apply_mp_style_corrections(
+                    total_energy, atoms, correction_type=self._correction_type
+                )
+
+            element_symbols = atoms.get_chemical_symbols()
+            element_counts = Counter(element_symbols)
+
+            missing_elements = set(element_symbols) - set(
+                self.element_references.keys()
             )
-        if not (CHARGE_RANGE[0] <= charge <= CHARGE_RANGE[1]):
-            raise ValueError(
-                f"Invalid value for charge: {charge}. Charge must be within the range {CHARGE_RANGE[0]} to {CHARGE_RANGE[1]}."
+            if missing_elements:
+                raise ValueError(
+                    f"Missing reference energies for elements: {missing_elements}"
+                )
+
+            total_ref_energy = sum(
+                self.element_references[element] * count
+                for element, count in element_counts.items()
             )
 
-        # Validate spin
-        spin = atoms.info["spin"]
-        if not isinstance(charge, (int, np.integer)):
-            raise TypeError(
-                f"Invalid type for spin: {type(spin)}. Spin must be an integer representing the spin multiplicity."
-            )
-        if not (SPIN_RANGE[0] <= spin <= SPIN_RANGE[1]):
-            raise ValueError(
-                f"Invalid value for spin: {spin}. Spin must be within the range {SPIN_RANGE[0]} to {SPIN_RANGE[1]}."
-            )
+            formation_energy = total_energy - total_ref_energy
+
+            self.results["energy"] = formation_energy
+
+            if "free_energy" in self.results:
+                self.results["free_energy"] = formation_energy
 
 
 class MixedPBCError(ValueError):

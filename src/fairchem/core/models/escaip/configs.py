@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 
 @dataclass
@@ -16,13 +16,9 @@ class GlobalConfigs:
     regress_stress: bool = False
     use_compile: bool = True
     use_padding: bool = True
-    use_residual_scaling: bool = True # new
-    use_global_path: bool = True # new
-    use_node_path: bool = True # new
+    use_fp16_backbone: bool = False
     dataset_list: list = field(default_factory=list)
-    # SV - lr 
-    j_coupling_hidden_dim: int = 128
-    hidden_size_lr: Optional[int] = 128
+
 
 @dataclass
 class MolecularGraphConfigs:
@@ -41,8 +37,6 @@ class MolecularGraphConfigs:
         "gaussian"
     )
     use_envelope: bool = True
-    
-
 
 
 @dataclass
@@ -53,32 +47,35 @@ class GraphNeuralNetworksConfigs:
         "flash",
     ]
     atten_num_heads: int
+    atom_embedding_size: int = 128
+    node_direction_embedding_size: int = 64
     node_direction_expansion_size: int = 10
-    edge_direction_expansion_size: int = 6
-    edge_distance_expansion_size: int = 512
+    edge_distance_expansion_size: int = 600
+    edge_distance_embedding_size: int = 512
+    readout_hidden_layer_multiplier: int = 2
     output_hidden_layer_multiplier: int = 2
     ffn_hidden_layer_multiplier: int = 2
-    attn_num_freq: int = 32
-    num_global_tokens: int = 8
+    use_angle_embedding: Literal["scalar", "bias", "none"] = "none"
+    angle_expansion_size: int = 10
+    angle_embedding_size: int = 8
+    use_graph_attention: bool = False
+    use_message_gate: bool = False
+    use_global_readout: bool = False
+    use_frequency_embedding: bool = True
     freequency_list: list = field(default_factory=lambda: [20, 10, 4, 10, 20])
     energy_reduce: Literal["sum", "mean"] = "sum"
-    use_freq_mask: bool = True # new
-    use_sincx_mask: bool = True # new
-    # SV - lr 
-    constrain_charge: bool = False
-    constrain_spin: bool = False
-    heisenberg_tf: bool = False
-    equil_charges_tf: bool = False
-    charge_scale: float = 1.0
+
 
 @dataclass
 class RegularizationConfigs:
     normalization: Literal["layernorm", "rmsnorm", "skip"] = "rmsnorm"
     mlp_dropout: float = 0.0
     atten_dropout: float = 0.0
+    stochastic_depth_prob: float = 0.0
     node_ffn_dropout: float = 0.0
     edge_ffn_dropout: float = 0.0
-    global_ffn_dropout: float = 0.0
+    scalar_output_dropout: float = 0.0
+    vector_output_dropout: float = 0.0
 
 
 @dataclass

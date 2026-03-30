@@ -31,7 +31,7 @@ from fairchem.core.models.uma.common.rotation import (
 )
 
 from fairchem.core.models.uma.common.so3 import CoefficientMapping, SO3_Grid
-from fairchem.core.models.uma.nn.embedding_dev import (
+from fairchem.core.models.uma.nn.embedding import (
     ChgSpinEmbedding,
     DatasetEmbedding,
     EdgeDegreeEmbedding,

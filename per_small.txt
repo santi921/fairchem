@@ -1,0 +1,186 @@
+/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/_export/utils.py:415: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _register_pytree_node(
+/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/hydra/plugins/config_source.py:125: UserWarning: Support for .yml files is deprecated. Use .yaml extension for Hydra config files
+  deprecation_warning(
+INFO:root:saved canonical config to /home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/canonical_config.yaml
+INFO:root:Running fairchemv2 cli with {'job': {'run_name': 'uma_lr_periodic_small', 'timestamp_id': '202511-0702-3619-075c', 'run_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma', 'device_type': <DeviceType.CUDA: 'cuda'>, 'debug': False, 'scheduler': {'mode': <SchedulerType.LOCAL: 'local'>, 'distributed_init_method': <DistributedInitMethod.TCP: 'tcp'>, 'ranks_per_node': 1, 'num_nodes': 1, 'num_array_jobs': 1, 'slurm': {'mem_gb': 80, 'timeout_hr': 168, 'cpus_per_task': 8, 'partition': None, 'qos': None, 'account': None, 'additional_parameters': None}, 'use_ray': False, 'ray_cluster': {'head_gpus': 0}}, 'logger': {'_target_': 'fairchem.core.common.logger.WandBSingletonLogger.init_wandb', '_partial_': True, 'entity': 'santi', 'project': 'uma-lr-omol-profiling'}, 'seed': 0, 'deterministic': False, 'runner_state_path': None, 'metadata': {'commit': 'core:fa9fcc6d,experimental:NA', 'log_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/logs', 'checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints', 'results_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/results', 'config_path': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/canonical_config.yaml', 'preemption_checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints/preemption_state', 'cluster_name': '', 'array_job_num': 0, 'slurm_env': {'job_id': None, 'raw_job_id': None, 'array_job_id': None, 'array_task_id': None, 'restart_count': None}}, 'graph_parallel_group_size': None}, 'runner': {'_target_': 'fairchem.core.components.train.train_runner.TrainEvalRunner', 'train_dataloader': {'_target_': 'fairchem.core.components.common.dataloader_builder.get_dataloader', 'dataset': {'_target_': 'fairchem.core.datasets.mt_concat_dataset.create_concat_dataset', 'dataset_configs': {'omol': {'splits': {'train': {'src': '/home/santiagovargas/dev/data/train_4M/', 'sample_n': 5000}}, 'format': 'ase_db', 'a2g_args': {'molecule_cell_size': 120.0, 'r_energy': True, 'r_forces': True, 'r_data_keys': ['spin', 'charge'], 'radius': 6.0, 'max_neigh': 30}, 'key_mapping': {'energy': 'omol_energy', 'forces': 'omol_forces'}, 'transforms': {'common_transform': {'dataset_name': 'omol'}}}}, 'combined_dataset_config': {'sampling': {'type': 'explicit', 'ratios': {'omol.train': 1.0}}}}, 'batch_sampler_fn': {'_target_': 'fairchem.core.datasets.samplers.max_atom_distributed_sampler.MaxAtomDistributedBatchSampler', '_partial_': True, 'max_atoms': 350, 'shuffle': True, 'seed': 0}, 'num_workers': 0, 'collate_fn': {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.mt_collater_adapter', 'tasks': [{'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_energy', 'level': 'system', 'property': 'energy', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.PerAtomMAELoss'}, 'coefficient': 10}, 'out_spec': {'dim': [1], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'element_references': {'_target_': 'fairchem.core.modules.normalization.element_references.ElementReferences', 'element_references': {'_target_': 'torch.DoubleTensor', '_args_': [[-1.156629225040026e-15, -16.001316695716987, -82.01087430838089, -201.82956857988097, -392.37382000025474, -678.7577802660586, -1037.0951083942327, -1490.3891424843594, -2047.6980007878883, -2717.4000859159146, -3511.9177958942937, -4412.34353756339, -5442.048852490966, -6589.238285511481, -7880.842380936224, -9290.366602061926, -10834.813633824462, -12522.319387833275, -14357.418706857397, -16323.294755148576, -18435.01990024982, -20696.697448280793, -23112.143048514245, -25682.83219323889, -28416.863013932467, -31314.828666123234, -34381.61625929281, -37622.0970301371, -41038.77074996302, -44633.87178654121, -48413.89305602666, -52371.64723336532, -56519.32612658109, -60840.896102839535, -65348.22274342182, -70042.31301581895, -74932.45491967947, -653.3100819462285, -831.4256441321643, -1038.3067074649807, -1270.5802453884555, -1546.2069619314702, -1844.151869397674, -2185.315025224292, -2572.1188857512716, -2998.6928887542217, -3471.81081638118, -3993.2282048969632, -4560.650406219408, -5163.202864090282, -5822.573487382639, -6540.2964462130585, -7296.665490756577, -8099.4071751019965, -8964.710394463762, -546.2179067379832, -689.6398798417333, -850.4805849513325, -12917.08295504127, -14058.981210064643, -15267.41531050162, -16544.445729634244, -17894.054958218647, -19321.404884189622, -20822.18831205945, -22422.829984851378, -24073.462031913972, -25787.271913480094, -27608.607061532348, -29517.834852414315, -31519.198453963163, -33610.154761607024, -1293.3349595217703, -1542.107003487292, -1813.074616850505, -2116.0691118518926, -2451.555058191304, -2827.017838069772, -3237.345589780805, -3682.7850194399866, -4168.118509910375, -4683.015643495902, -5238.7226964026495, -5832.098572286902, -6469.07296, -7140.86455, -7854.60638, 0.0, -1.6479188753456857, -4.207893480442443, -6.239290333069828, -5.835083816475604, -5.524155726787739, -4.817312409713694, -3.57567303141045, -2.943452582378457, -4.000608087317199, -3.212923593441274, -2.031396852627386, -1.378447864282869]]}}, 'datasets': ['omol'], 'metrics': ['mae', 'per_atom_mae']}, {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_forces', 'level': 'atom', 'property': 'forces', 'train_on_free_atoms': True, 'eval_on_free_atoms': True, 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.L2NormLoss'}, 'reduction': 'per_structure', 'coefficient': 5}, 'out_spec': {'dim': [3], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'datasets': ['omol'], 'metrics': ['mae', 'cosine_similarity', 'magnitude_error']}], 'exclude_keys': ['id', 'fid', 'absolute_idx', 'target_pos', 'ref_energy', 'pbc', 'nads', 'oc22', 'formation_energy', 'total_charge']}}, 'eval_dataloader': {'_target_': 'fairchem.core.components.common.dataloader_builder.get_dataloader', 'dataset': {'_target_': 'fairchem.core.datasets.mt_concat_dataset.create_concat_dataset', 'dataset_configs': {'omol': {'splits': {'val': {'sample_n': 200, 'src': '/home/santiagovargas/dev/data/val/'}}, 'format': 'ase_db', 'a2g_args': {'molecule_cell_size': 120.0, 'r_energy': True, 'r_forces': True, 'r_data_keys': ['spin', 'charge'], 'radius': 6.0, 'max_neigh': 30}, 'key_mapping': {'energy': 'omol_energy', 'forces': 'omol_forces'}, 'transforms': {'common_transform': {'dataset_name': 'omol'}}}}, 'combined_dataset_config': {'sampling': {'type': 'temperature', 'temperature': 1.0}}}, 'batch_sampler_fn': {'_target_': 'fairchem.core.datasets.samplers.max_atom_distributed_sampler.MaxAtomDistributedBatchSampler', '_partial_': True, 'max_atoms': 350, 'min_atoms': 8, 'shuffle': False, 'seed': 0}, 'num_workers': 0, 'collate_fn': {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.mt_collater_adapter', 'tasks': [{'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_energy', 'level': 'system', 'property': 'energy', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.PerAtomMAELoss'}, 'coefficient': 10}, 'out_spec': {'dim': [1], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'element_references': {'_target_': 'fairchem.core.modules.normalization.element_references.ElementReferences', 'element_references': {'_target_': 'torch.DoubleTensor', '_args_': [[-1.156629225040026e-15, -16.001316695716987, -82.01087430838089, -201.82956857988097, -392.37382000025474, -678.7577802660586, -1037.0951083942327, -1490.3891424843594, -2047.6980007878883, -2717.4000859159146, -3511.9177958942937, -4412.34353756339, -5442.048852490966, -6589.238285511481, -7880.842380936224, -9290.366602061926, -10834.813633824462, -12522.319387833275, -14357.418706857397, -16323.294755148576, -18435.01990024982, -20696.697448280793, -23112.143048514245, -25682.83219323889, -28416.863013932467, -31314.828666123234, -34381.61625929281, -37622.0970301371, -41038.77074996302, -44633.87178654121, -48413.89305602666, -52371.64723336532, -56519.32612658109, -60840.896102839535, -65348.22274342182, -70042.31301581895, -74932.45491967947, -653.3100819462285, -831.4256441321643, -1038.3067074649807, -1270.5802453884555, -1546.2069619314702, -1844.151869397674, -2185.315025224292, -2572.1188857512716, -2998.6928887542217, -3471.81081638118, -3993.2282048969632, -4560.650406219408, -5163.202864090282, -5822.573487382639, -6540.2964462130585, -7296.665490756577, -8099.4071751019965, -8964.710394463762, -546.2179067379832, -689.6398798417333, -850.4805849513325, -12917.08295504127, -14058.981210064643, -15267.41531050162, -16544.445729634244, -17894.054958218647, -19321.404884189622, -20822.18831205945, -22422.829984851378, -24073.462031913972, -25787.271913480094, -27608.607061532348, -29517.834852414315, -31519.198453963163, -33610.154761607024, -1293.3349595217703, -1542.107003487292, -1813.074616850505, -2116.0691118518926, -2451.555058191304, -2827.017838069772, -3237.345589780805, -3682.7850194399866, -4168.118509910375, -4683.015643495902, -5238.7226964026495, -5832.098572286902, -6469.07296, -7140.86455, -7854.60638, 0.0, -1.6479188753456857, -4.207893480442443, -6.239290333069828, -5.835083816475604, -5.524155726787739, -4.817312409713694, -3.57567303141045, -2.943452582378457, -4.000608087317199, -3.212923593441274, -2.031396852627386, -1.378447864282869]]}}, 'datasets': ['omol'], 'metrics': ['mae', 'per_atom_mae']}, {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_forces', 'level': 'atom', 'property': 'forces', 'train_on_free_atoms': True, 'eval_on_free_atoms': True, 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.L2NormLoss'}, 'reduction': 'per_structure', 'coefficient': 5}, 'out_spec': {'dim': [3], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'datasets': ['omol'], 'metrics': ['mae', 'cosine_similarity', 'magnitude_error']}], 'exclude_keys': ['id', 'fid', 'absolute_idx', 'target_pos', 'ref_energy', 'pbc', 'nads', 'oc22', 'formation_energy', 'total_charge']}}, 'train_eval_unit': {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.MLIPTrainEvalUnit', 'job_config': {'run_name': 'uma_lr_periodic_small', 'timestamp_id': '202511-0702-3619-075c', 'run_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma', 'device_type': <DeviceType.CUDA: 'cuda'>, 'debug': False, 'scheduler': {'mode': <SchedulerType.LOCAL: 'local'>, 'distributed_init_method': <DistributedInitMethod.TCP: 'tcp'>, 'ranks_per_node': 1, 'num_nodes': 1, 'num_array_jobs': 1, 'slurm': {'mem_gb': 80, 'timeout_hr': 168, 'cpus_per_task': 8, 'partition': None, 'qos': None, 'account': None, 'additional_parameters': None}, 'use_ray': False, 'ray_cluster': {'head_gpus': 0}}, 'logger': {'_target_': 'fairchem.core.common.logger.WandBSingletonLogger.init_wandb', '_partial_': True, 'entity': 'santi', 'project': 'uma-lr-omol-profiling'}, 'seed': 0, 'deterministic': False, 'runner_state_path': None, 'metadata': {'commit': 'core:fa9fcc6d,experimental:NA', 'log_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/logs', 'checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints', 'results_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/results', 'config_path': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/canonical_config.yaml', 'preemption_checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints/preemption_state', 'cluster_name': '', 'array_job_num': 0, 'slurm_env': {'job_id': None, 'raw_job_id': None, 'array_job_id': None, 'array_task_id': None, 'restart_count': None}}, 'graph_parallel_group_size': None}, 'tasks': [{'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_energy', 'level': 'system', 'property': 'energy', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.PerAtomMAELoss'}, 'coefficient': 10}, 'out_spec': {'dim': [1], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'element_references': {'_target_': 'fairchem.core.modules.normalization.element_references.ElementReferences', 'element_references': {'_target_': 'torch.DoubleTensor', '_args_': [[-1.156629225040026e-15, -16.001316695716987, -82.01087430838089, -201.82956857988097, -392.37382000025474, -678.7577802660586, -1037.0951083942327, -1490.3891424843594, -2047.6980007878883, -2717.4000859159146, -3511.9177958942937, -4412.34353756339, -5442.048852490966, -6589.238285511481, -7880.842380936224, -9290.366602061926, -10834.813633824462, -12522.319387833275, -14357.418706857397, -16323.294755148576, -18435.01990024982, -20696.697448280793, -23112.143048514245, -25682.83219323889, -28416.863013932467, -31314.828666123234, -34381.61625929281, -37622.0970301371, -41038.77074996302, -44633.87178654121, -48413.89305602666, -52371.64723336532, -56519.32612658109, -60840.896102839535, -65348.22274342182, -70042.31301581895, -74932.45491967947, -653.3100819462285, -831.4256441321643, -1038.3067074649807, -1270.5802453884555, -1546.2069619314702, -1844.151869397674, -2185.315025224292, -2572.1188857512716, -2998.6928887542217, -3471.81081638118, -3993.2282048969632, -4560.650406219408, -5163.202864090282, -5822.573487382639, -6540.2964462130585, -7296.665490756577, -8099.4071751019965, -8964.710394463762, -546.2179067379832, -689.6398798417333, -850.4805849513325, -12917.08295504127, -14058.981210064643, -15267.41531050162, -16544.445729634244, -17894.054958218647, -19321.404884189622, -20822.18831205945, -22422.829984851378, -24073.462031913972, -25787.271913480094, -27608.607061532348, -29517.834852414315, -31519.198453963163, -33610.154761607024, -1293.3349595217703, -1542.107003487292, -1813.074616850505, -2116.0691118518926, -2451.555058191304, -2827.017838069772, -3237.345589780805, -3682.7850194399866, -4168.118509910375, -4683.015643495902, -5238.7226964026495, -5832.098572286902, -6469.07296, -7140.86455, -7854.60638, 0.0, -1.6479188753456857, -4.207893480442443, -6.239290333069828, -5.835083816475604, -5.524155726787739, -4.817312409713694, -3.57567303141045, -2.943452582378457, -4.000608087317199, -3.212923593441274, -2.031396852627386, -1.378447864282869]]}}, 'datasets': ['omol'], 'metrics': ['mae', 'per_atom_mae']}, {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit.Task', 'name': 'omol_forces', 'level': 'atom', 'property': 'forces', 'train_on_free_atoms': True, 'eval_on_free_atoms': True, 'loss_fn': {'_target_': 'fairchem.core.modules.loss.DDPMTLoss', 'loss_fn': {'_target_': 'fairchem.core.modules.loss.L2NormLoss'}, 'reduction': 'per_structure', 'coefficient': 5}, 'out_spec': {'dim': [3], 'dtype': 'float32'}, 'normalizer': {'_target_': 'fairchem.core.modules.normalization.normalizer.Normalizer', 'mean': 0.0, 'rmsd': 1.433569}, 'datasets': ['omol'], 'metrics': ['mae', 'cosine_similarity', 'magnitude_error']}], 'model': {'_target_': 'fairchem.core.models.base.HydraModel', 'backbone': {'model': 'escnmd_backbone_lr', 'max_num_elements': 100, 'sphere_channels': 64, 'lmax': 2, 'mmax': 2, 'use_pbc': True, 'use_pbc_single': True, 'edge_channels': 64, 'distance_function': 'gaussian', 'num_distance_basis': 64, 'regress_forces': True, 'regress_stress': False, 'direct_forces': True, 'num_layers': 3, 'hidden_channels': 64, 'norm_type': 'rms_norm_sh', 'act_type': 'gate', 'ff_type': 'spectral', 'chg_spin_emb_type': 'rand_emb', 'cs_emb_grad': True, 'dataset_list': ['omol'], 'hidden_channels_lr': 16, 'heisenberg_tf': False, 'latent_charge_tf': True, 'otf_graph': True, 'cutoff_lr': 15.0, 'lr_output_scaling_factor': 1.0, 'normalize_charges_tf': False, 'equil_charges_tf': False, 'use_ewald_tf': True}, 'heads': {'omol_energy': {'module': 'esen_mlp_energy_head_lr'}, 'omol_forces': {'module': 'esen_linear_force_head'}}}, 'optimizer_fn': {'_target_': 'torch.optim.AdamW', '_partial_': True, 'lr': 0.0008, 'weight_decay': 1e-05}, 'cosine_lr_scheduler_fn': {'_target_': 'fairchem.core.units.mlip_unit.mlip_unit._get_consine_lr_scheduler', '_partial_': True, 'warmup_factor': 0.2, 'warmup_epochs': 0.01, 'lr_min_factor': 0.01, 'epochs': 200, 'steps': None}, 'print_every': 10, 'clip_grad_norm': 100, 'bf16': True}, 'max_epochs': 200, 'max_steps': None, 'evaluate_every_n_steps': 10000, 'callbacks': [{'_target_': 'fairchem.core.common.profiler_utils.ProfilerCallback', 'job_config': {'run_name': 'uma_lr_periodic_small', 'timestamp_id': '202511-0702-3619-075c', 'run_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma', 'device_type': <DeviceType.CUDA: 'cuda'>, 'debug': False, 'scheduler': {'mode': <SchedulerType.LOCAL: 'local'>, 'distributed_init_method': <DistributedInitMethod.TCP: 'tcp'>, 'ranks_per_node': 1, 'num_nodes': 1, 'num_array_jobs': 1, 'slurm': {'mem_gb': 80, 'timeout_hr': 168, 'cpus_per_task': 8, 'partition': None, 'qos': None, 'account': None, 'additional_parameters': None}, 'use_ray': False, 'ray_cluster': {'head_gpus': 0}}, 'logger': {'_target_': 'fairchem.core.common.logger.WandBSingletonLogger.init_wandb', '_partial_': True, 'entity': 'santi', 'project': 'uma-lr-omol-profiling'}, 'seed': 0, 'deterministic': False, 'runner_state_path': None, 'metadata': {'commit': 'core:fa9fcc6d,experimental:NA', 'log_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/logs', 'checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints', 'results_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/results', 'config_path': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/canonical_config.yaml', 'preemption_checkpoint_dir': '/home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints/preemption_state', 'cluster_name': '', 'array_job_num': 0, 'slurm_env': {'job_id': None, 'raw_job_id': None, 'array_job_id': None, 'array_task_id': None, 'restart_count': None}}, 'graph_parallel_group_size': None}}, {'_target_': 'fairchem.core.components.train.train_runner.TrainCheckpointCallback', 'checkpoint_every_n_steps': 5000, 'max_saved_checkpoints': 5}]}}
+INFO:root:Running in local mode with 1 ranks using device_type:cuda
+INFO:root:Running in local mode without elastic launch
+INFO:root:Setting env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+INFO:root:Setting up distributed backend...
+wandb: Currently logged in as: santi to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.20.1
+wandb: Run data is saved locally in /home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/logs/wandb/run-20251107_023620-202511-0702-3619-075c
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run uma_lr_periodic_small
+wandb: ⭐️ View project at https://wandb.ai/santi/uma-lr-omol-profiling
+wandb: 🚀 View run at https://wandb.ai/santi/uma-lr-omol-profiling/runs/202511-0702-3619-075c
+INFO:root:Calling runner.run() ...
+INFO:root:get_dataloader::Calling batch_sampler_fn=functools.partial(<class 'fairchem.core.datasets.samplers.max_atom_distributed_sampler.MaxAtomDistributedBatchSampler'>, max_atoms=350, shuffle=True, seed=0)...
+INFO:root:Sampler batch generation times: get natoms: 0.0009818077087402344, total: 0.365497350692749
+INFO:root:MaxAtomDistributedSampler generated 888 batches with total atoms 269452, max: 350, min: 68, mean: 303.43693693693695, std: 44.48438926089626
+INFO:root:0 samples were removed because they exceed 350 atoms
+INFO:root:get_dataloader::Calling Dataloader...
+INFO:root:get_dataloader::Done!
+INFO:root:get_dataloader::Calling batch_sampler_fn=functools.partial(<class 'fairchem.core.datasets.samplers.max_atom_distributed_sampler.MaxAtomDistributedBatchSampler'>, max_atoms=350, min_atoms=8, shuffle=False, seed=0)...
+INFO:root:Sampler batch generation times: get natoms: 8.487701416015625e-05, total: 0.00016188621520996094
+INFO:root:MaxAtomDistributedSampler generated 79 batches with total atoms 21963, max: 350, min: 155, mean: 278.0126582278481, std: 49.39110094366693
+INFO:root:0 samples were removed because they exceed 350 atoms
+INFO:root:get_dataloader::Calling Dataloader...
+INFO:root:get_dataloader::Done!
+INFO:root:Train Dataloader size 888
+INFO:root:Eval Dataloader size 79
+INFO:root:No existing checkpoints found, starting from scratch
+INFO:torchtnt.framework.fit:Started fit with max_epochs=200 max_steps=None max_train_steps_per_epoch=None max_eval_steps_per_epoch=None evaluate_every_n_steps=10000 evaluate_every_n_epochs=1 
+INFO:torchtnt.framework.train:Started train with max_epochs=200, max_steps=None, max_steps_per_epoch=None
+INFO:root:on_train_start: setting sampler state to 0, 0
+INFO:root:at beginning of epoch 0, setting sampler start step to 0
+INFO:torchtnt.framework.train:Started train epoch
+INFO:root:at beginning of epoch 0, setting sampler start step to 0
+INFO:root:Saved dcp checkpoint to /home/santiagovargas/dev/fairchem/dev/training/uma/202511-0702-3619-075c/checkpoints/step_0
+/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:384: UserWarning: To get the last learning rate computed by the scheduler, please use `get_last_lr()`.
+  _warn_get_lr_called_within_step(self)
+INFO:root:{'train/loss': 348.17805588276144, 'train/lr': 0.00016, 'train/step': 0, 'train/epoch': 0.0, 'train/samples_per_second(approx)': 2.411997235087703, 'train/atoms_per_second(approx)': 165.8248099122796, 'train/num_atoms_on_rank': 275, 'train/num_samples_on_rank': 4}
+ERROR:root:Exception during training! On step 6
+ERROR:root:Data info: AtomicData(atomic_numbers=[288], atomic_numbers_full=[288], batch=[288], batch_full=[288], cell=[1, 3, 3], cell_offsets=[0, 3], charge=[1], dataset=[1], dataset_name=[1], edge_index=[2, 0], fixed=[288], natoms=[1], nedges=[1], omol_energy=[1], omol_forces=[288, 3], pbc=[1, 3], pos=[288, 3], sid=[1], spin=[1], tags=[288])
+data.dataset: ['omol']
+data.sid: ['']
+data.natoms: tensor([288], device='cuda:0')
+data.atomic_numbers: tensor([6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1, 6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        6, 8, 6, 6, 7, 6, 6, 8, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+       device='cuda:0')
+INFO:torchtnt.framework.fit:Exception during fit after the following progress: train progress: completed epochs: 0, completed steps: 6, completed steps in current epoch: 6. eval progress: completed epochs: 0, completed steps: 0, completed steps in current epoch: 0.:
+CUDA out of memory. Tried to allocate 4.87 GiB. GPU 0 has a total capacity of 23.68 GiB of which 680.31 MiB is free. Including non-PyTorch memory, this process has 22.61 GiB memory in use. Of the allocated memory 21.06 GiB is allocated by PyTorch, and 97.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/bin/fairchem", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/_cli.py", line 134, in main
+    local_launch(cfg, log_dir)
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 288, in local_launch
+    runner_wrapper(cfg)
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 85, in runner_wrapper
+    SlurmSPMDProgram()(config, run_type)
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 159, in __call__
+    self.runner.run()
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/components/train/train_runner.py", line 159, in run
+    fit(
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/fit.py", line 144, in fit
+    raise e
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/fit.py", line 133, in fit
+    _train_impl(state, unit, callback_handler)
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/train.py", line 148, in _train_impl
+    _train_epoch_impl(state, train_unit, callback_handler)
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/train.py", line 215, in _train_epoch_impl
+    train_state._step_output = train_unit.train_step(state, step_input)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/units/mlip_unit/mlip_unit.py", line 698, in train_step
+    pred = self.model.forward(batch_on_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1643, in forward
+    else self._run_ddp_forward(*inputs, **kwargs)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1459, in _run_ddp_forward
+    return self.module(*inputs, **kwargs)  # type: ignore[index]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/base.py", line 188, in forward
+    out[k] = self.output_heads[k](data, emb)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/uma/escn_md.py", line 1933, in forward
+    lr_energy = self.get_lr_energies(emb, data_dict)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/uma/escn_md.py", line 1871, in get_lr_energies
+    energy_output_lr_dict = potential_full_ewald_batched(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/utils/lr.py", line 258, in potential_full_ewald_batched
+    sin_k_dot_r *= q_b#.unsqueeze(1)
+    ^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.87 GiB. GPU 0 has a total capacity of 23.68 GiB of which 680.31 MiB is free. Including non-PyTorch memory, this process has 22.61 GiB memory in use. Of the allocated memory 21.06 GiB is allocated by PyTorch, and 97.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/bin/fairchem", line 8, in <module>
+[rank0]:     sys.exit(main())
+[rank0]:              ^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/_cli.py", line 134, in main
+[rank0]:     local_launch(cfg, log_dir)
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 288, in local_launch
+[rank0]:     runner_wrapper(cfg)
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 85, in runner_wrapper
+[rank0]:     SlurmSPMDProgram()(config, run_type)
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/launchers/slurm_launch.py", line 159, in __call__
+[rank0]:     self.runner.run()
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/components/train/train_runner.py", line 159, in run
+[rank0]:     fit(
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/fit.py", line 144, in fit
+[rank0]:     raise e
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/fit.py", line 133, in fit
+[rank0]:     _train_impl(state, unit, callback_handler)
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/train.py", line 148, in _train_impl
+[rank0]:     _train_epoch_impl(state, train_unit, callback_handler)
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torchtnt/framework/train.py", line 215, in _train_epoch_impl
+[rank0]:     train_state._step_output = train_unit.train_step(state, step_input)
+[rank0]:                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/units/mlip_unit/mlip_unit.py", line 698, in train_step
+[rank0]:     pred = self.model.forward(batch_on_device)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1643, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1459, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/base.py", line 188, in forward
+[rank0]:     out[k] = self.output_heads[k](data, emb)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1739, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/miniconda3/envs/fair-chem-lead/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1750, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/uma/escn_md.py", line 1933, in forward
+[rank0]:     lr_energy = self.get_lr_energies(emb, data_dict)
+[rank0]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/uma/escn_md.py", line 1871, in get_lr_energies
+[rank0]:     energy_output_lr_dict = potential_full_ewald_batched(
+[rank0]:                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/santiagovargas/dev/fairchem/src/fairchem/core/models/utils/lr.py", line 258, in potential_full_ewald_batched
+[rank0]:     sin_k_dot_r *= q_b#.unsqueeze(1)
+[rank0]:     ^^^^^^^^^^^^^^^^^^
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.87 GiB. GPU 0 has a total capacity of 23.68 GiB of which 680.31 MiB is free. Including non-PyTorch memory, this process has 22.61 GiB memory in use. Of the allocated memory 21.06 GiB is allocated by PyTorch, and 97.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33muma_lr_periodic_small[0m at: [34mhttps://wandb.ai/santi/uma-lr-omol-profiling/runs/202511-0702-3619-075c[0m
+[1;34mwandb[0m: Find logs at: [1;35mdev/training/uma/202511-0702-3619-075c/logs/wandb/run-20251107_023620-202511-0702-3619-075c/logs[0m

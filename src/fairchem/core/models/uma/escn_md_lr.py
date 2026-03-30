@@ -26,7 +26,7 @@ from fairchem.core.models.uma.common.rotation import (
     init_edge_rot_euler_angles,
 )
 from fairchem.core.models.uma.common.so3 import CoefficientMapping, SO3_Grid
-from fairchem.core.models.uma.nn.embedding_dev import (
+from fairchem.core.models.uma.nn.embedding import (
     ChgSpinEmbedding,
     DatasetEmbedding,
     EdgeDegreeEmbedding,
@@ -49,7 +49,7 @@ from fairchem.core.models.utils.lr import (
     potential_full_from_edge_inds,
 )
 
-from .escn_md import ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE, pad_edges
+from .escn_md import ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE
 from .escn_md_block import eSCNMD_Block
 
 if TYPE_CHECKING:
@@ -411,9 +411,6 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                 graph_dict["node_partition"]
             ]
             data_dict["batch"] = data_dict["batch_full"][graph_dict["node_partition"]]
-
-        if self.edge_chunk_size is not None:
-            pad_edges(graph_dict, self.edge_chunk_size, self.cutoff)
 
         return graph_dict
 

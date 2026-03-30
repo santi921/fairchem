@@ -9,27 +9,39 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
+from omegaconf import DictConfig, ListConfig
+from torch.distributed.nn.functional import all_reduce as all_reduce_with_grad
 from torch.profiler import record_function
-from torch_scatter import scatter_add
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import generate_graph
 from fairchem.core.models.base import HeadInterface
+from fairchem.core.models.uma.common.quaternion.quaternion_wigner_utils import (
+    create_wigner_data_module,
+)
+from fairchem.core.models.uma.common.quaternion.wigner_d_hybrid import (
+    axis_angle_wigner_hybrid,
+)
 from fairchem.core.models.uma.common.rotation import (
     eulers_to_wigner,
     init_edge_rot_euler_angles,
 )
 from fairchem.core.models.uma.common.so3 import CoefficientMapping, SO3_Grid
-from fairchem.core.models.uma.nn.embedding_dev import (
+from fairchem.core.models.uma.nn.embedding import (
     ChgSpinEmbedding,
     DatasetEmbedding,
     EdgeDegreeEmbedding,
+)
+from fairchem.core.models.uma.nn.execution_backends import (
+    get_execution_backend,
 )
 from fairchem.core.models.uma.nn.layer_norm import (
     EquivariantLayerNormArray,
@@ -41,111 +53,58 @@ from fairchem.core.models.uma.nn.layer_norm import (
 from fairchem.core.models.uma.nn.mole_utils import MOLEInterface
 from fairchem.core.models.uma.nn.radial import GaussianSmearing, PolynomialEnvelope
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
-from fairchem.core.models.utils.irreps import cg_change_mat, irreps_sum
-from fairchem.core.models.utils.lr import (
-    heisenberg_potential_full_from_edge_inds,
-    potential_full_ewald_batched,
-    potential_full_from_edge_inds,
-    batch_spin_charge_renormalization
+from fairchem.core.models.uma.outputs import (
+    compute_energy,
+    compute_forces,
+    compute_forces_and_stress,
+    compute_hessian,
+    get_l_component_range,
+    reduce_node_to_system,
 )
+from fairchem.core.models.utils.irreps import cg_change_mat, irreps_sum
+from fairchem.core.units.mlip_unit.api.inference import (
+    CHARGE_RANGE,
+    DEFAULT_CHARGE,
+    DEFAULT_SPIN,
+    DEFAULT_SPIN_OMOL,
+    SPIN_RANGE,
+    UMATask,
+)
+from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 
 from .escn_md_block import eSCNMD_Block
 
 if TYPE_CHECKING:
+    from ase import Atoms
+
     from fairchem.core.datasets.atomic_data import AtomicData
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 
 
 ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE = 1024 * 128
+AUTO_EDGE_CHUNK_FRACTION = 0.05
 
 
-def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
-    graph_dict["edge_index"] = torch.cat(
-        (
-            graph_dict["edge_index"].new_ones(2, edges_to_add)
-            * graph_dict["node_offset"],
-            graph_dict["edge_index"],
-        ),
-        dim=1,
-    )
-
-    self_edge_distance_vec = graph_dict["edge_distance_vec"].new_ones(1, 3) + cutoff
-    graph_dict["edge_distance_vec"] = torch.cat(
-        (
-            self_edge_distance_vec.expand(edges_to_add, 3),
-            graph_dict["edge_distance_vec"],
-        ),
-        dim=0,
-    )
-
-    edge_distance = torch.linalg.norm(self_edge_distance_vec, dim=-1, keepdim=False)
-    graph_dict["edge_distance"] = torch.cat(
-        (edge_distance.expand(edges_to_add), graph_dict["edge_distance"]), dim=0
-    )
-
-
-@torch.compiler.disable
-def pad_edges(graph_dict, edge_chunk_size: int, cutoff: float):
-    n_edges = n_edges_post = graph_dict["edge_index"].shape[1]
-
-    if edge_chunk_size > 0 and n_edges_post % edge_chunk_size != 0:
-        # make sure we have a multiple of self.edge_chunk_size edges
-        n_edges_post += edge_chunk_size - n_edges_post % edge_chunk_size
-
-    n_edges_post = max(n_edges_post, 1)  # at least 1 edge to avoid empty "edge" case
-    if n_edges_post > n_edges:
-        # We append synthetic padding edges whose distance vector has norm > cutoff
-        # (see add_n_empty_edges where distance_vec is set to 1+cutoff). The radial
-        # polynomial envelope returns 0 for distances >= cutoff, so these edges never
-        # contribute to embeddings or message passing; they only ensure the edge count
-        # is a multiple of edge_chunk_size (or at least one edge), aiding chunked
-        # activation checkpointing and avoiding empty tensor edge cases.
-        add_n_empty_edges(graph_dict, n_edges_post - n_edges, cutoff)
-
-def compose_tensor(
-    trace: torch.Tensor,
-    l2_symmetric: torch.Tensor,
-) -> torch.Tensor:
-    """Re-compose a tensor from its decomposition
-
-    Args:
-        trace: a tensor with scalar part of the decomposition of r2 tensors in the batch
-        l2_symmetric: tensor with the symmetric/traceless part of decomposition
-
-    Returns:
-        tensor: rank 2 tensor
+@dataclass
+class GradRegressConfig:
+    """
+    Configuration for gradient-based computation of forces and stress.
     """
 
-    if trace.shape[1] != 1:
-        raise ValueError("batch of traces must be shape (batch size, 1)")
-
-    if l2_symmetric.shape[1] != 5:
-        raise ValueError("batch of l2_symmetric tensors must be shape (batch size, 5)")
-
-    if trace.shape[0] != l2_symmetric.shape[0]:
-        raise ValueError(
-            "Shape missmatch between trace and l2_symmetric parts. The first dimension is the batch dimension"
-        )
-
-    batch_size = trace.shape[0]
-    decomposed_preds = torch.zeros(
-        batch_size, irreps_sum(2), device=trace.device
-    )  # rank 2
-    decomposed_preds[:, : irreps_sum(0)] = trace
-    decomposed_preds[:, irreps_sum(1) : irreps_sum(2)] = l2_symmetric
-
-    r2_tensor = torch.einsum(
-        "ba, cb->ca",
-        cg_change_mat(2, device=trace.device),
-        decomposed_preds,
-    )
-    return r2_tensor
+    direct_forces: bool = False
+    direct_stress: bool = False
+    forces: bool = False
+    stress: bool = False
+    hessian: bool = False
+    hessian_vmap: bool = True
 
 
-def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
+def add_n_empty_edges(
+    graph_dict: dict, edges_to_add: int, cutoff: float, node_offset: int = 0
+):
     graph_dict["edge_index"] = torch.cat(
         (
-            graph_dict["edge_index"].new_ones(2, edges_to_add)
-            * graph_dict["node_offset"],
+            graph_dict["edge_index"].new_ones(2, edges_to_add) * node_offset,
             graph_dict["edge_index"],
         ),
         dim=1,
@@ -166,107 +125,144 @@ def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
     )
 
 
-@torch.compiler.disable
-def pad_edges(graph_dict, edge_chunk_size: int, cutoff: float):
-    n_edges = n_edges_post = graph_dict["edge_index"].shape[1]
-
-    if edge_chunk_size > 0 and n_edges_post % edge_chunk_size != 0:
-        # make sure we have a multiple of self.edge_chunk_size edges
-        n_edges_post += edge_chunk_size - n_edges_post % edge_chunk_size
-
-    n_edges_post = max(n_edges_post, 1)  # at least 1 edge to avoid empty "edge" case
-    if n_edges_post > n_edges:
-        # We append synthetic padding edges whose distance vector has norm > cutoff
-        # (see add_n_empty_edges where distance_vec is set to 1+cutoff). The radial
-        # polynomial envelope returns 0 for distances >= cutoff, so these edges never
-        # contribute to embeddings or message passing; they only ensure the edge count
-        # is a multiple of edge_chunk_size (or at least one edge), aiding chunked
-        # activation checkpointing and avoiding empty tensor edge cases.
-        add_n_empty_edges(graph_dict, n_edges_post - n_edges, cutoff)
-
-
-def compose_tensor(
-    trace: torch.Tensor,
-    l2_symmetric: torch.Tensor,
-) -> torch.Tensor:
-    """Re-compose a tensor from its decomposition
+def validate_contiguous_channels(channels: list[int], name: str) -> tuple[int, int]:
+    """Validate channels are contiguous, return (start, end) slice indices.
 
     Args:
-        trace: a tensor with scalar part of the decomposition of r2 tensors in the batch
-        l2_symmetric: tensor with the symmetric/traceless part of decomposition
+        channels: List of channel indices to validate
+        name: Name of the channel list for error messages
 
     Returns:
-        tensor: rank 2 tensor
+        Tuple of (start_idx, end_idx) for slicing. Returns (0, 0) if channels is empty.
+
+    Raises:
+        ValueError: If channels are not contiguous
     """
+    if not channels:
+        return 0, 0
+    sorted_channels = sorted(channels)
+    expected = list(range(sorted_channels[0], sorted_channels[-1] + 1))
+    if sorted_channels != expected:
+        raise ValueError(f"{name} must be contiguous (e.g., [0, 1, 2]). Got {channels}")
+    return sorted_channels[0], sorted_channels[-1] + 1
 
-    if trace.shape[1] != 1:
-        raise ValueError("batch of traces must be shape (batch size, 1)")
 
-    if l2_symmetric.shape[1] != 5:
-        raise ValueError("batch of l2_symmetric tensors must be shape (batch size, 5)")
+def balance_channels_batched(
+    emb: torch.Tensor,
+    target: torch.Tensor,
+    natoms: torch.Tensor,
+    batch: torch.Tensor,
+    start_idx: int,
+    end_idx: int,
+    target_offset: float = 0.0,
+) -> torch.Tensor:
+    """Balance a contiguous range of channels to target sum per system.
 
-    if trace.shape[0] != l2_symmetric.shape[0]:
-        raise ValueError(
-            "Shape missmatch between trace and l2_symmetric parts. The first dimension is the batch dimension"
+    This batched version processes all channels in a contiguous range in a single
+    call, which is more efficient than processing each channel individually.
+
+    Args:
+        emb: Node embeddings of shape [num_atoms, sph_features, channels]
+        target: Target sum per system of shape [num_systems]
+        natoms: Number of atoms per system of shape [num_systems]
+        batch: Batch indices mapping atoms to systems of shape [num_atoms]
+        start_idx: Start index of channel range (inclusive)
+        end_idx: End index of channel range (exclusive)
+        target_offset: Offset to subtract from target (e.g., 1.0 for spin)
+
+    Returns:
+        Modified embeddings with the specified channel range balanced to sum to target.
+
+    Supports graph parallel (GP) mode using torch.distributed.nn.functional.all_reduce
+    which provides correct gradients in both forward and backward passes.
+    """
+    out_emb = emb.clone()
+    num_systems = len(natoms)
+    n_channels = end_idx - start_idx
+
+    # Batched extraction: [num_atoms, n_channels]
+    channels_to_balance = emb[:, 0, start_idx:end_idx]
+
+    # Batched sum: [num_systems, n_channels]
+    system_sums = torch.zeros(
+        num_systems, n_channels, device=emb.device, dtype=emb.dtype
+    )
+    system_sums.index_add_(0, batch, channels_to_balance)
+
+    # Reduce partial sums across all graph parallel ranks
+    if gp_utils.initialized():
+        system_sums = all_reduce_with_grad(system_sums, group=gp_utils.get_gp_group())
+
+    # Batched correction: broadcast target to all channels
+    target_sums = (target - target_offset).unsqueeze(1).expand(-1, n_channels)
+    corrections = (system_sums - target_sums) / natoms.unsqueeze(1)
+
+    out_emb[:, 0, start_idx:end_idx] = channels_to_balance - corrections[batch]
+    return out_emb
+
+
+def resolve_dataset_mapping(
+    deprecated_list: list[str] | None,
+    dataset_mapping: dict[str, str] | None,
+    deprecated_param_name: str = "dataset_list",
+) -> dict[str, str]:
+    """
+    Validate and resolve dataset mapping from either a deprecated list or a mapping dict.
+
+    Args:
+        deprecated_list: Deprecated list of dataset names. If provided, it is
+            converted to a mapping where each name maps to itself.
+        dataset_mapping: Mapping from the config dataset name to desired dataset name for embeddings and heads.
+            Allows multiple subsets to share the same dataset embedding and/or output head by mapping
+            them to the same identifier.
+        deprecated_param_name: Name of the deprecated parameter, used in
+            warning/error messages.
+
+    Returns:
+        The resolved dataset mapping dict.
+
+    Raises:
+        ValueError: If both or neither arguments are provided, if the mapping
+            is not a non-empty dict, or if mapping values are not a subset of
+            mapping keys.
+    """
+    if deprecated_list is not None and dataset_mapping is not None:
+        msg = (
+            f"Both '{deprecated_param_name}' (={deprecated_list}) and "
+            f"'dataset_mapping' (={dataset_mapping}) have been provided. "
+            f"Please provide 'dataset_mapping' only in the config as '{deprecated_param_name}' is deprecated."
         )
-
-    batch_size = trace.shape[0]
-    decomposed_preds = torch.zeros(
-        batch_size, irreps_sum(2), device=trace.device
-    )  # rank 2
-    decomposed_preds[:, : irreps_sum(0)] = trace
-    decomposed_preds[:, irreps_sum(1) : irreps_sum(2)] = l2_symmetric
-
-    r2_tensor = torch.einsum(
-        "ba, cb->ca",
-        cg_change_mat(2, device=trace.device),
-        decomposed_preds,
-    )
-    return r2_tensor
-
-
-def add_n_empty_edges(graph_dict: dict, edges_to_add: int, cutoff: float):
-    graph_dict["edge_index"] = torch.cat(
-        (
-            graph_dict["edge_index"].new_ones(2, edges_to_add)
-            * graph_dict["node_offset"],
-            graph_dict["edge_index"],
-        ),
-        dim=1,
-    )
-
-    self_edge_distance_vec = graph_dict["edge_distance_vec"].new_ones(1, 3) + cutoff
-    graph_dict["edge_distance_vec"] = torch.cat(
-        (
-            self_edge_distance_vec.expand(edges_to_add, 3),
-            graph_dict["edge_distance_vec"],
-        ),
-        dim=0,
-    )
-
-    edge_distance = torch.linalg.norm(self_edge_distance_vec, dim=-1, keepdim=False)
-    graph_dict["edge_distance"] = torch.cat(
-        (edge_distance.expand(edges_to_add), graph_dict["edge_distance"]), dim=0
-    )
-
-
-@torch.compiler.disable
-def pad_edges(graph_dict, edge_chunk_size: int, cutoff: float):
-    n_edges = n_edges_post = graph_dict["edge_index"].shape[1]
-
-    if edge_chunk_size > 0 and n_edges_post % edge_chunk_size != 0:
-        # make sure we have a multiple of self.edge_chunk_size edges
-        n_edges_post += edge_chunk_size - n_edges_post % edge_chunk_size
-
-    n_edges_post = max(n_edges_post, 1)  # at least 1 edge to avoid empty "edge" case
-    if n_edges_post > n_edges:
-        # We append synthetic padding edges whose distance vector has norm > cutoff
-        # (see add_n_empty_edges where distance_vec is set to 1+cutoff). The radial
-        # polynomial envelope returns 0 for distances >= cutoff, so these edges never
-        # contribute to embeddings or message passing; they only ensure the edge count
-        # is a multiple of edge_chunk_size (or at least one edge), aiding chunked
-        # activation checkpointing and avoiding empty tensor edge cases.
-        add_n_empty_edges(graph_dict, n_edges_post - n_edges, cutoff)
+        logging.error(msg, stack_info=True)
+        raise ValueError(msg)
+    if deprecated_list is None and dataset_mapping is None:
+        msg = "'dataset_mapping' must be provided in the config to use dataset embeddings."
+        logging.error(msg, stack_info=True)
+        raise ValueError(msg)
+    if deprecated_list is not None:
+        if not isinstance(deprecated_list, (list, ListConfig)):
+            msg = f"If '{deprecated_param_name}' is provided in the config, it must be a list of dataset names. Got: {deprecated_list!r}"
+            logging.error(msg, stack_info=True)
+            raise ValueError(msg)
+        dataset_mapping = {name: name for name in deprecated_list}
+        logging.warning(
+            f"If '{deprecated_param_name}' is provided in the config, the code assumes that each dataset "
+            f"maps to itself. Please use 'dataset_mapping' as '{deprecated_param_name}' "
+            "is deprecated and will be removed in the future."
+        )
+    if not isinstance(dataset_mapping, (dict, DictConfig)) or not dataset_mapping:
+        msg = f"'dataset_mapping' must be a non-empty dictionary, got: {dataset_mapping!r}"
+        logging.error(msg, stack_info=True)
+        raise ValueError(msg)
+    if not set(dataset_mapping.values()) <= set(dataset_mapping.keys()):
+        missing = set(dataset_mapping.values()) - set(dataset_mapping.keys())
+        msg = (
+            f"dataset_mapping values {missing} are not present in "
+            f"dataset_mapping keys {set(dataset_mapping.keys())}. "
+            f"Values must be a subset of keys. Full mapping provided: {dataset_mapping}"
+        )
+        logging.error(msg, stack_info=True)
+        raise ValueError(msg)
+    return dataset_mapping
 
 
 @registry.register_model("escnmd_backbone")
@@ -290,7 +286,10 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         num_distance_basis: int = 512,
         direct_forces: bool = True,
         regress_forces: bool = True,
+        direct_stress: bool = False,
         regress_stress: bool = False,
+        regress_hessian: bool = False,
+        hessian_vmap: bool = True,
         # escnmd specific
         num_layers: int = 2,
         hidden_channels: int = 128,
@@ -301,11 +300,21 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         chg_spin_emb_type: Literal["pos_emb", "lin_emb", "rand_emb"] = "pos_emb",
         cs_emb_grad: bool = False,
         dataset_emb_grad: bool = False,
-        dataset_list: list[str] | None = None,
+        dataset_list: (
+            list[str] | None
+        ) = None,  # deprecated, use dataset_mapping instead
+        dataset_mapping: (
+            dict[str, str] | None
+        ) = None,  # mapping from config dataset name to dataset embedding name e.g. {"omol": "omol", "oc20": "oc20", "oc20_subset": "oc20"}, this allows multiple subsets to use the same dataset embedding.
         use_dataset_embedding: bool = True,
-        radius_pbc_version: int = 1,
+        use_cuda_graph_wigner: bool = False,
+        use_quaternion_wigner: bool = True,
+        radius_pbc_version: int = 2,
         always_use_pbc: bool = True,
-        edge_chunk_size: int | None = None,
+        charge_balanced_channels: list[int] | None = None,
+        spin_balanced_channels: list[int] | None = None,
+        edge_chunk_size: int = 1,
+        execution_mode: str = "general",
     ) -> None:
         super().__init__()
         self.max_num_elements = max_num_elements
@@ -321,14 +330,33 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         self.always_use_pbc = always_use_pbc
 
         # energy conservation related
-        self.regress_forces = regress_forces
-        self.direct_forces = direct_forces
-        self.regress_stress = regress_stress
+        self.regress_config = GradRegressConfig(
+            direct_forces=direct_forces,
+            forces=regress_forces,
+            stress=regress_stress,
+            direct_stress=direct_stress,
+            hessian=regress_hessian,
+            hessian_vmap=hessian_vmap,
+        )
+
+        # which channels to balance - validate contiguity and store slice indices
+        charge_channels = (
+            list(charge_balanced_channels) if charge_balanced_channels else []
+        )
+        spin_channels = list(spin_balanced_channels) if spin_balanced_channels else []
+
+        self.charge_channel_start, self.charge_channel_end = (
+            validate_contiguous_channels(charge_channels, "charge_balanced_channels")
+        )
+        self.spin_channel_start, self.spin_channel_end = validate_contiguous_channels(
+            spin_channels, "spin_balanced_channels"
+        )
 
         # NOTE: graph construction related, to remove, except for cutoff
         self.otf_graph = otf_graph
         self.max_neighbors = max_neighbors
         self.radius_pbc_version = radius_pbc_version
+        self.use_quaternion_wigner = use_quaternion_wigner
         self.enforce_max_neighbors_strictly = False
 
         activation_checkpoint_chunk_size = None
@@ -339,21 +367,29 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
         self.edge_chunk_size = edge_chunk_size
 
+        self.backend = get_execution_backend(execution_mode)
+
         # related to charge spin dataset system embedding
         self.chg_spin_emb_type = chg_spin_emb_type
         self.cs_emb_grad = cs_emb_grad
         self.dataset_emb_grad = dataset_emb_grad
+        self.dataset_mapping = dataset_mapping
         self.dataset_list = dataset_list
         self.use_dataset_embedding = use_dataset_embedding
         if self.use_dataset_embedding:
-            assert (
-                self.dataset_list
-            ), "the dataset list is empty, please add it to the model backbone config"
-
+            self.dataset_mapping = resolve_dataset_mapping(
+                self.dataset_list, dataset_mapping, "dataset_list"
+            )
         # rotation utils
         Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
         for l in range(self.lmax + 1):
             self.register_buffer(f"Jd_{l}", Jd_list[l])
+
+        # Precompute Wigner coefficients for quaternion path (like Jd for Euler path)
+        if self.use_quaternion_wigner:
+            # lmin=5 because l=0,1,2,3,4 use custom kernels in the hybrid method
+            self.wigner_data = create_wigner_data_module(lmax=self.lmax, lmin=5)
+
         self.sph_feature_size = int((self.lmax + 1) ** 2)
         self.mappingReduced = CoefficientMapping(self.lmax, self.mmax)
 
@@ -389,8 +425,8 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         if self.use_dataset_embedding:
             self.dataset_embedding = DatasetEmbedding(
                 self.sphere_channels,
-                grad=self.dataset_emb_grad,
-                dataset_list=self.dataset_list,
+                enable_grad=self.dataset_emb_grad,
+                dataset_mapping=self.dataset_mapping,
             )
             # mix charge, spin, dataset embeddings
             self.mix_csd = nn.Linear(3 * self.sphere_channels, self.sphere_channels)
@@ -434,6 +470,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             rescale_factor=5.0,  # NOTE: sqrt avg degree
             mappingReduced=self.mappingReduced,
             activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+            backend=self.backend,
         )
 
         self.envelope = PolynomialEnvelope(exponent=5)
@@ -460,6 +497,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 self.act_type,
                 self.ff_type,
                 activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+                backend=self.backend,
             )
             self.blocks.append(block)
 
@@ -474,78 +512,80 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         )
         self.register_buffer("coefficient_index", coefficient_index, persistent=False)
 
+    @property  # deprecate this
+    def direct_forces(self) -> bool:
+        return self.regress_config.direct_forces
+
+    @property  # deprecate this
+    def regress_forces(self) -> bool:
+        return self.regress_config.forces
+
+    @property  # deprecate this
+    def regress_stress(self) -> bool:
+        return self.regress_config.stress
+
+    def balance_channels(
+        self,
+        x_message_prime: torch.Tensor,
+        charge: torch.Tensor,
+        spin: torch.Tensor,
+        natoms: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.charge_channel_end > self.charge_channel_start:
+            x_message_prime = balance_channels_batched(
+                emb=x_message_prime,
+                target=charge,
+                natoms=natoms,
+                batch=batch,
+                start_idx=self.charge_channel_start,
+                end_idx=self.charge_channel_end,
+                target_offset=0.0,
+            )
+        if self.spin_channel_end > self.spin_channel_start:
+            x_message_prime = balance_channels_batched(
+                emb=x_message_prime,
+                target=spin,
+                natoms=natoms,
+                batch=batch,
+                start_idx=self.spin_channel_start,
+                end_idx=self.spin_channel_end,
+                target_offset=1.0,
+            )
+        return x_message_prime
+
     def _get_rotmat_and_wigner(
         self, edge_distance_vecs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Jd_buffers = [
-            getattr(self, f"Jd_{l}").type(edge_distance_vecs.dtype)
-            for l in range(self.lmax + 1)
-        ]
+        if self.use_quaternion_wigner:
+            with record_function("obtain rotmat wigner quaternion"):
+                wigner, wigner_inv = axis_angle_wigner_hybrid(
+                    edge_distance_vecs,
+                    self.lmax,
+                    coeffs=self.wigner_data.coeffs,
+                    U_blocks=self.wigner_data.U_blocks,
+                    custom_kernels=self.wigner_data.custom_kernels,
+                )
+        else:
+            Jd_buffers = [
+                getattr(self, f"Jd_{l}").type(edge_distance_vecs.dtype)
+                for l in range(self.lmax + 1)
+            ]
 
-        with record_function("obtain rotmat wigner original"):
-            euler_angles = init_edge_rot_euler_angles(edge_distance_vecs)
-            wigner = eulers_to_wigner(
-                euler_angles,
-                0,
-                self.lmax,
-                Jd_buffers,
-            )
-            wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
+            with record_function("obtain rotmat wigner original"):
+                euler_angles = init_edge_rot_euler_angles(edge_distance_vecs)
+                wigner = eulers_to_wigner(
+                    euler_angles,
+                    0,
+                    self.lmax,
+                    Jd_buffers,
+                )
+                wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
 
-        # select subset of coefficients we are using
-        if self.mmax != self.lmax:
-            wigner = wigner.index_select(1, self.coefficient_index)
-            wigner_inv = wigner_inv.index_select(2, self.coefficient_index)
-
-        wigner_and_M_mapping = torch.einsum(
-            "mk,nkj->nmj", self.mappingReduced.to_m.to(wigner.dtype), wigner
-        )
-        wigner_and_M_mapping_inv = torch.einsum(
-            "njk,mk->njm", wigner_inv, self.mappingReduced.to_m.to(wigner_inv.dtype)
-        )
-        return wigner_and_M_mapping, wigner_and_M_mapping_inv
-
-    def _get_displacement_and_cell(
-        self, data_dict: AtomicData
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        ###############################################################
-        # gradient-based forces/stress
-        ###############################################################
-        displacement = None
-        orig_cell = None
-        if self.regress_stress and not self.direct_forces:
-            displacement = torch.zeros(
-                (3, 3),
-                dtype=data_dict["pos"].dtype,
-                device=data_dict["pos"].device,
-            )
-            num_batch = len(data_dict["natoms"])
-            displacement = displacement.view(-1, 3, 3).expand(num_batch, 3, 3)
-            displacement.requires_grad = True
-            symmetric_displacement = 0.5 * (
-                displacement + displacement.transpose(-1, -2)
-            )
-            if data_dict["pos"].requires_grad is False:
-                data_dict["pos"].requires_grad = True
-            data_dict["pos_original"] = data_dict["pos"]
-            data_dict["pos"] = data_dict["pos"] + torch.bmm(
-                data_dict["pos"].unsqueeze(-2),
-                torch.index_select(symmetric_displacement, 0, data_dict["batch"]),
-            ).squeeze(-2)
-
-            orig_cell = data_dict["cell"]
-            data_dict["cell"] = data_dict["cell"] + torch.bmm(
-                data_dict["cell"], symmetric_displacement
-            )
-
-        if (
-            not self.regress_stress
-            and self.regress_forces
-            and not self.direct_forces
-            and data_dict["pos"].requires_grad is False
-        ):
-            data_dict["pos"].requires_grad = True
-        return displacement, orig_cell
+        # Both axis_angle_wigner_hybrid and eulers_to_wigner return contiguous D
+        # (created via torch.zeros + slice assignment)
+        # wigner_inv is made contiguous by .transpose().contiguous() above
+        return wigner, wigner_inv
 
     def csd_embedding(self, charge, spin, dataset):
         with record_function("charge spin dataset embeddings"):
@@ -561,40 +601,66 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             return torch.nn.SiLU()(self.mix_csd(torch.cat((chg_emb, spin_emb), dim=1)))
 
     def _generate_graph(self, data_dict):
+        data_dict["gp_node_offset"] = 0
+        node_partition = None
+        if gp_utils.initialized():
+            # create the partitions
+            atomic_numbers_full = data_dict["atomic_numbers_full"]
+            node_partition = torch.tensor_split(
+                torch.arange(
+                    len(atomic_numbers_full), device=atomic_numbers_full.device
+                ),
+                gp_utils.get_gp_world_size(),
+            )[gp_utils.get_gp_rank()]
+            assert (
+                node_partition.numel() > 0
+            ), "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+
         if self.otf_graph:
             pbc = None
             if self.always_use_pbc:
                 pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
             else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
+                assert (
+                    "pbc" in data_dict
+                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
                 pbc = data_dict["pbc"]
-            assert pbc.all() or (~pbc).all(), (
-                "We can only accept pbc that is all true or all false"
-            )
-            logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
+            assert (
+                pbc.all() or (~pbc).all()
+            ), "We can only accept pbc that is all true or all false"
+            # for v2 graph gen we used to pass node_partition as part of the data_dict directly to radius_pbc to allow it generate partial graphs
+            # to make it more general to accomodate v3, we scrapped and instead have generate_graph handle the partitioning after the graph has been generated
             graph_dict = generate_graph(
                 data_dict,
                 cutoff=self.cutoff,
                 max_neighbors=self.max_neighbors,
                 enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
                 radius_pbc_version=self.radius_pbc_version,
-                pbc=pbc
+                pbc=pbc,
+                node_partition=node_partition,
             )
         else:
             # this assume edge_index is provided
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
-            cell_per_edge = data_dict["cell"].repeat_interleave(
-                data_dict["nedges"], dim=0
-            )
-            shifts = torch.einsum(
-                "ij,ijk->ik",
-                data_dict["cell_offsets"].to(cell_per_edge.dtype),
-                cell_per_edge,
-            )
+            assert (
+                "edge_index" in data_dict
+            ), "otf_graph is false, need to provide edge_index as input!"
+
+            # Compute shifts from cell offsets
+            if len(data_dict["natoms"]) == 1:
+                # Single system: use matmul (compile-friendly, no data-dependent ops)
+                shifts = data_dict["cell_offsets"].to(
+                    data_dict["cell"].dtype
+                ) @ data_dict["cell"].squeeze(0)
+            else:
+                # Batched: need repeat_interleave for variable edges per system
+                cell_per_edge = data_dict["cell"].repeat_interleave(
+                    data_dict["nedges"], dim=0
+                )
+                shifts = torch.einsum(
+                    "ij,ijk->ik",
+                    data_dict["cell_offsets"].to(cell_per_edge.dtype),
+                    cell_per_edge,
+                )
             edge_distance_vec = (
                 data_dict["pos"][data_dict["edge_index"][0]]
                 - data_dict["pos"][data_dict["edge_index"][1]]
@@ -610,20 +676,16 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 "edge_distance": edge_distance,
                 "edge_distance_vec": edge_distance_vec,
             }
-        graph_dict["node_offset"] = 0  # default value
 
         if gp_utils.initialized():
-            graph_dict = self._init_gp_partitions(
-                graph_dict, data_dict["atomic_numbers_full"]
-            )
-            # create partial atomic numbers and batch tensors for GP
             data_dict["atomic_numbers"] = data_dict["atomic_numbers_full"][
-                graph_dict["node_partition"]
+                node_partition
             ]
-            data_dict["batch"] = data_dict["batch_full"][graph_dict["node_partition"]]
+            data_dict["batch"] = data_dict["batch_full"][node_partition]
+            data_dict["gp_node_offset"] = node_partition.min().item()
 
-        if self.edge_chunk_size is not None:
-            pad_edges(graph_dict, self.edge_chunk_size, self.cutoff)
+        if graph_dict["edge_index"].shape[1] == 0:
+            add_n_empty_edges(graph_dict, 1, self.cutoff, data_dict["gp_node_offset"])
 
         return graph_dict
 
@@ -645,22 +707,30 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             csd_mixed_emb=csd_mixed_emb,
         )
 
-        with record_function("get_displacement_and_cell"):
-            displacement, orig_cell = self._get_displacement_and_cell(data_dict)
+        # Enable gradients for autograd-based force/stress computation.
+        # Must be set before graph generation so the computation graph
+        # tracks positions and cell through edge distance calculations.
+        if not self.regress_config.direct_forces:
+            if self.regress_config.forces or self.regress_config.stress:
+                data_dict["pos"].requires_grad_(True)
+            if self.regress_config.stress:
+                data_dict["cell"].requires_grad_(True)
 
         with record_function("generate_graph"):
             graph_dict = self._generate_graph(data_dict)
 
-        if graph_dict["edge_index"].numel() == 0:
-            raise ValueError(
-                f"No edges found in input system, this means either you have a single atom in the system or the atoms are farther apart than the radius cutoff of the model of {self.cutoff} Angstroms. We don't know how to handle this case. Check the positions of system: {data_dict['pos']}"
-            )
-
         with record_function("obtain wigner"):
-            (wigner_and_M_mapping, wigner_and_M_mapping_inv) = (
-                self._get_rotmat_and_wigner(
-                    graph_dict["edge_distance_vec"],
-                )
+            wigner, wigner_inv = self._get_rotmat_and_wigner(
+                graph_dict["edge_distance_vec"],
+            )
+            coefficient_index = (
+                self.coefficient_index if self.mmax != self.lmax else None
+            )
+            wigner, wigner_inv = self.backend.prepare_wigner(
+                wigner,
+                wigner_inv,
+                self.mappingReduced,
+                coefficient_index,
             )
 
         ###############################################################
@@ -705,1258 +775,373 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]
             )
             x_edge = torch.cat(
-                (edge_distance_embedding, source_embedding, target_embedding), dim=1
+                (edge_distance_embedding, source_embedding, target_embedding),
+                dim=1,
             )
+
+            # Pre-fuse envelope into wigner_inv
+            wigner_inv_envelope = wigner_inv * edge_envelope
+
             x_message = self.edge_degree_embedding(
                 x_message,
                 x_edge,
                 graph_dict["edge_index"],
-                wigner_and_M_mapping_inv,
-                edge_envelope,
-                graph_dict["node_offset"],
+                wigner_inv_envelope,
+                data_dict["gp_node_offset"],
             )
 
         ###############################################################
         # Update spherical node embeddings
         ###############################################################
+
+        # Get edge embeddings for each layer
+        # General backend: raw x_edge (rad_func computed inside SO2_Convolution)
+        # Fast backends: precomputed radials
+        with record_function("layer_radial_emb"):
+            x_edge_per_layer = self.backend.get_layer_radial_emb(x_edge, self)
+
         for i in range(self.num_layers):
             with record_function(f"message passing {i}"):
                 x_message = self.blocks[i](
                     x_message,
-                    x_edge,
-                    graph_dict["edge_distance"],
+                    x_edge_per_layer[i],
                     graph_dict["edge_index"],
-                    wigner_and_M_mapping,
-                    wigner_and_M_mapping_inv,
-                    edge_envelope,
+                    wigner,
+                    wigner_inv_envelope,
                     total_atoms_across_gp_ranks=data_dict["atomic_numbers_full"].shape[
                         0
                     ],
                     sys_node_embedding=sys_node_embedding,
-                    node_offset=graph_dict["node_offset"],
+                    node_offset=data_dict["gp_node_offset"],
+                )
+                # balance any channels requested
+                x_message = self.balance_channels(
+                    x_message,
+                    charge=data_dict["charge"],
+                    spin=data_dict["spin"],
+                    natoms=data_dict["natoms"],
+                    batch=data_dict["batch"],
                 )
 
         # Final layer norm
         x_message = self.norm(x_message)
         out = {
             "node_embedding": x_message,
-            "displacement": displacement,
-            "orig_cell": orig_cell,
             "batch": data_dict["batch"],
         }
         return out
 
-    def _init_gp_partitions(self, graph_dict, atomic_numbers_full):
-        """Graph Parallel
-        This creates the required partial tensors for each rank given the full tensors.
-        The tensors are split on the dimension along the node index using node_partition.
-        """
-        edge_index = graph_dict["edge_index"]
+    @property
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
-        node_partition = torch.tensor_split(
-            torch.arange(len(atomic_numbers_full)).to(atomic_numbers_full.device),
-            gp_utils.get_gp_world_size(),
-        )[gp_utils.get_gp_rank()]
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set:
+        no_wd_list = []
+        named_parameters_list = [name for name, _ in self.named_parameters()]
+        for module_name, module in self.named_modules():
+            if isinstance(
+                module,
+                (
+                    torch.nn.Linear,
+                    SO3_Linear,
+                    torch.nn.LayerNorm,
+                    EquivariantLayerNormArray,
+                    EquivariantLayerNormArraySphericalHarmonics,
+                    EquivariantRMSNormArraySphericalHarmonics,
+                    EquivariantRMSNormArraySphericalHarmonicsV2,
+                ),
+            ):
+                for parameter_name, _ in module.named_parameters():
+                    if (
+                        isinstance(module, (torch.nn.Linear, SO3_Linear))
+                        and "weight" in parameter_name
+                    ):
+                        continue
+                    global_parameter_name = module_name + "." + parameter_name
+                    assert global_parameter_name in named_parameters_list
+                    no_wd_list.append(global_parameter_name)
+
+        return set(no_wd_list)
+
+    @classmethod
+    def build_inference_settings(cls, settings: InferenceSettings) -> dict:
+        """Build backbone config overrides from inference settings."""
+        overrides = {}
+
+        # Always disable PBC wrapping for inference
+        overrides["always_use_pbc"] = False
+
+        if settings.activation_checkpointing is not None:
+            overrides["activation_checkpointing"] = settings.activation_checkpointing
+        if settings.edge_chunk_size is not None:
+            overrides["edge_chunk_size"] = settings.edge_chunk_size
+        if settings.external_graph_gen is not None:
+            overrides["otf_graph"] = not settings.external_graph_gen
+        if settings.internal_graph_gen_version is not None:
+            overrides["radius_pbc_version"] = settings.internal_graph_gen_version
+        if settings.use_quaternion_wigner is not None:
+            overrides["use_quaternion_wigner"] = settings.use_quaternion_wigner
+        if settings.execution_mode is not None:
+            overrides["execution_mode"] = settings.execution_mode
+
+        return overrides
+
+    def get_default_untrained_tasks(
+        self,
+        checkpoint_tasks: dict[str, Task],
+        inference_settings: InferenceSettings,
+    ) -> list[Task]:
+        """
+        Return default untrained tasks for eSCNMDBackbone.
+
+        For this backbone, we add stress tasks for all energy datasets
+        that don't already have stress (either trained or explicitly requested).
+        Stress can be computed via autograd from energy predictions.
+
+        Returns empty list if the model uses direct forces, since autograd-based
+        stress computation requires energy-conserving force computation.
+        """
+        # Direct force models can't compute stress via autograd
+        if self.direct_forces:
+            return []
+
+        tasks = []
+
+        # Find datasets with energy but no stress
+        energy_datasets = set()
+        stress_datasets = set()
+        energy_task_by_dataset = {}
+
+        for task in checkpoint_tasks.values():
+            if task.property == "energy":
+                for dataset in task.datasets:
+                    energy_datasets.add(dataset)
+                    energy_task_by_dataset[dataset] = task
+            elif task.property == "stress":
+                stress_datasets.update(task.datasets)
+
+        # Also exclude datasets already in predict_untrained_stress
+        stress_datasets.update(inference_settings.predict_untrained_stress)
+
+        # Create stress tasks for missing datasets
+        missing_stress_datasets = energy_datasets - stress_datasets
+
+        for dataset in missing_stress_datasets:
+            energy_task = energy_task_by_dataset[dataset]
+            # Infer task name prefix from energy task naming convention
+            task_prefix = "" if energy_task.name == "energy" else f"{dataset}_"
+            tasks.append(
+                Task(
+                    name=f"{task_prefix}stress",
+                    level="system",
+                    property="stress",
+                    out_spec=OutputSpec(
+                        dim=[1, 9], dtype=inference_settings.base_precision_dtype
+                    ),
+                    normalizer=energy_task.normalizer,
+                    datasets=[dataset],
+                    loss_fn=None,
+                    element_references=None,
+                    metrics=[],
+                    train_on_free_atoms=True,
+                    eval_on_free_atoms=True,
+                    inference_only=True,
+                )
+            )
+
+        return tasks
+
+    def validate_tasks(self, dataset_to_tasks: dict[str, list]) -> None:
+        """
+        Validate that task datasets are compatible with this backbone.
+        """
+        if self.use_dataset_embedding:
+            assert set(dataset_to_tasks.keys()).issubset(
+                set(self.dataset_mapping.keys())
+            ), "Datasets in tasks is not a strict subset of datasets in backbone."
+
+    def prepare_for_inference(self, data: AtomicData, settings: InferenceSettings):
+        """
+        Prepare model for inference. Called once on first prediction.
+
+        For UMA: handles MOLE merging if settings.merge_mole is True.
+        Stores initial composition for consistency checking.
+
+        Returns:
+            self or a new merged backbone if MOLE merging was performed. We return
+            because type could have changed due to merging MOLE.
+        """
+        self._inference_settings = settings
+        self._merged_composition = None
+
+        # Validate settings against backend requirements (fail early)
+        self.backend.validate(self.lmax, self.mmax, settings)
+
+        if settings.merge_mole:
+            assert (
+                data.natoms.numel() == 1
+            ), "Cannot merge model with multiple systems in batch"
+            # Store composition we merged on
+            self._merged_composition = self._get_composition_info(data)
+            # Merge the model - returns new merged backbone
+            new_backbone = self.merge_MOLE_model(data)
+            # Transfer inference state to new backbone
+            new_backbone._inference_settings = settings
+            new_backbone._merged_composition = self._merged_composition
+            self.backend.prepare_model_for_inference(new_backbone)
+            return new_backbone
+
+        self.backend.prepare_model_for_inference(self)
+        return self
+
+    def on_predict_check(self, data: AtomicData) -> None:
+        """
+        Called before each prediction. UMA checks MOLE consistency here.
+        """
+        if not getattr(self, "_inference_settings", None):
+            return  # Not initialized yet
+
+        if self._inference_settings.merge_mole and self._merged_composition is not None:
+            assert (
+                data.natoms.numel() == 1
+            ), "Cannot run merged model on batch with multiple systems"
+            current = self._get_composition_info(data)
+            self._assert_composition_matches(current)
+
+    def _get_composition_info(self, data) -> tuple:
+        """
+        Get composition info for MOLE consistency checking.
+        """
+        composition = data.atomic_numbers.new_zeros(
+            self.max_num_elements, dtype=torch.int
+        ).index_add(
+            0,
+            data.atomic_numbers.to(torch.int),
+            data.atomic_numbers.new_ones(len(data.atomic_numbers), dtype=torch.int),
+        )
+        return (
+            composition,
+            getattr(data, "charge", None),
+            getattr(data, "spin", None),
+            getattr(data, "dataset", [None]),
+        )
+
+    def _assert_composition_matches(self, current: tuple) -> None:
+        """
+        Assert current composition matches what model was merged on.
+        """
+        merged = self._merged_composition
+        # Move current tensors to same device as merged (CPU) for comparison
+        device = merged[0].device
+
+        merged_norm = merged[0].float() / merged[0].sum()
+        curr_norm = current[0].float().to(device) / current[0].sum().to(device)
+
+        assert merged_norm.isclose(
+            curr_norm, rtol=1e-5
+        ).all(), "Compositions differ from merged model"
+
+        # Charge and spin are tensors that need device alignment
+        merged_charge = merged[1]
+        curr_charge = (
+            current[1].to(device)
+            if isinstance(current[1], torch.Tensor)
+            else current[1]
+        )
         assert (
-            node_partition.numel() > 0
-        ), "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+            (merged_charge == curr_charge).all()
+            if isinstance(merged_charge, torch.Tensor)
+            else merged_charge == curr_charge
+        ), f"Charge differs: {merged_charge} vs {current[1]}"
 
-        assert node_partition.numel() > 0, (
-            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
+        merged_spin = merged[2]
+        curr_spin = (
+            current[2].to(device)
+            if isinstance(current[2], torch.Tensor)
+            else current[2]
         )
-        edge_partition = torch.where(
-            torch.logical_and(
-                edge_index[1] >= node_partition.min(),
-                edge_index[1] <= node_partition.max(),  # TODO: 0 or 1?
-            )
-        )[0]
-        graph_dict["node_offset"] = node_partition.min().item()
-        graph_dict["node_partition"] = node_partition
-        # gp versions of data
-        graph_dict["edge_index"] = edge_index[:, edge_partition]
-        graph_dict["edge_distance"] = graph_dict["edge_distance"][edge_partition]
-        graph_dict["edge_distance_vec"] = graph_dict["edge_distance_vec"][
-            edge_partition
-        ]
-        return graph_dict
+        assert (
+            (merged_spin == curr_spin).all()
+            if isinstance(merged_spin, torch.Tensor)
+            else merged_spin == curr_spin
+        ), f"Spin differs: {merged_spin} vs {current[2]}"
 
+        assert merged[3] == current[3], f"Dataset differs: {merged[3]} vs {current[3]}"
 
-    @property
-    def num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-    @torch.jit.ignore
-    def no_weight_decay(self) -> set:
-        no_wd_list = []
-        named_parameters_list = [name for name, _ in self.named_parameters()]
-        for module_name, module in self.named_modules():
-            if isinstance(
-                module,
-                (
-                    torch.nn.Linear,
-                    SO3_Linear,
-                    torch.nn.LayerNorm,
-                    EquivariantLayerNormArray,
-                    EquivariantLayerNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonicsV2,
-                ),
-            ):
-                for parameter_name, _ in module.named_parameters():
-                    if (
-                        isinstance(module, (torch.nn.Linear, SO3_Linear))
-                        and "weight" in parameter_name
-                    ):
-                        continue
-                    global_parameter_name = module_name + "." + parameter_name
-                    assert global_parameter_name in named_parameters_list
-                    no_wd_list.append(global_parameter_name)
-
-        return set(no_wd_list)
-
-
-@registry.register_model("escnmd_backbone_lr")
-class eSCNMDBackboneLR(nn.Module, MOLEInterface):
-    def __init__(
-        self,
-        max_num_elements: int = 100,
-        sphere_channels: int = 128,
-        lmax: int = 2,
-        mmax: int = 2,
-        grid_resolution: int | None = None,
-        num_sphere_samples: int = 128,  # NOTE not used
-        # NOTE: graph construction related, to remove
-        otf_graph: bool = False,
-        max_neighbors: int = 300,
-        use_pbc: bool = True,  # deprecated
-        use_pbc_single: bool = True,  # deprecated
-        cutoff: float = 5.0,
-        edge_channels: int = 128,
-        distance_function: Literal["gaussian"] = "gaussian",
-        num_distance_basis: int = 512,
-        direct_forces: bool = True,
-        regress_forces: bool = True,
-        regress_stress: bool = False,
-        # escnmd specific
-        num_layers: int = 2,
-        hidden_channels: int = 128,
-        norm_type: str = "rms_norm_sh",
-        act_type: str = "gate",
-        ff_type: str = "grid",
-        activation_checkpointing: bool = False,
-        chg_spin_emb_type: Literal["pos_emb", "lin_emb", "rand_emb"] = "pos_emb",
-        cs_emb_grad: bool = False,
-        dataset_emb_grad: bool = False,
-        dataset_list: list[str] | None = None,
-        use_dataset_embedding: bool = True,
-        radius_pbc_version: int = 1,
-        always_use_pbc: bool = True,
-        hidden_channels_lr: int = 64,  # extra for LR
-        heisenberg_tf: bool = False,  # extra for LR
-        latent_charge_tf: bool = True,  # extra for LR
-        return_bec: bool = False,  # TODO: change back
-        conv_function_tf: bool = True,  # extra for LR
-        lr_output_scaling_factor: float = 1.0, # extra for LR
-        cutoff_lr: float = -1.0,  # extra for LR, -1 means the sr cutoff is used for electrostatics/magnetic terms
-        normalize_charges_tf: bool = True,  # extra for LR
-        equil_charges_tf: bool = False,  # extra for LR
-        use_ewald_tf: bool = False,  # extra for LR
-    ) -> None:
-        super().__init__()
-        self.max_num_elements = max_num_elements
-        self.lmax = lmax
-        self.mmax = mmax
-        self.sphere_channels = sphere_channels
-        self.grid_resolution = grid_resolution
-        self.num_sphere_samples = num_sphere_samples
-        # set this True if we want to ALWAYS use pbc for internal graph gen
-        # despite what's in the input data this only affects when otf_graph is True
-        # in this mode, the user must be responsible for providing a large vaccum box
-        # for aperiodic systems
-        self.always_use_pbc = always_use_pbc
-
-        # energy conservation related
-        self.regress_forces = regress_forces
-        self.direct_forces = direct_forces
-        self.regress_stress = regress_stress
-
-        # NOTE: graph construction related, to remove, except for cutoff
-        self.otf_graph = otf_graph
-        self.max_neighbors = max_neighbors
-        self.radius_pbc_version = radius_pbc_version
-        self.enforce_max_neighbors_strictly = False
-
-        activation_checkpoint_chunk_size = None
-        if activation_checkpointing:
-            # The size of edge blocks to use in activation checkpointing
-            activation_checkpoint_chunk_size = ESCNMD_DEFAULT_EDGE_CHUNK_SIZE
-
-        # related to charge spin dataset system embedding
-        self.chg_spin_emb_type = chg_spin_emb_type
-        self.cs_emb_grad = cs_emb_grad
-        self.dataset_emb_grad = dataset_emb_grad
-        self.dataset_list = dataset_list
-        self.use_dataset_embedding = use_dataset_embedding
-        if self.use_dataset_embedding:
-            assert (
-                self.dataset_list
-            ), "the dataset list is empty, please add it to the model backbone config"
-
-
-        # rotation utils
-        Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
-        for l in range(self.lmax + 1):
-            self.register_buffer(f"Jd_{l}", Jd_list[l])
-        self.sph_feature_size = int((self.lmax + 1) ** 2)
-        self.mappingReduced = CoefficientMapping(self.lmax, self.mmax)
-
-        # lmax_lmax for node, lmax_mmax for edge
-        self.SO3_grid = nn.ModuleDict()
-        self.SO3_grid["lmax_lmax"] = SO3_Grid(
-            self.lmax, self.lmax, resolution=grid_resolution, rescale=True
-        )
-        self.SO3_grid["lmax_mmax"] = SO3_Grid(
-            self.lmax, self.mmax, resolution=grid_resolution, rescale=True
-        )
-
-        # atom embedding
-        self.sphere_embedding = nn.Embedding(
-            self.max_num_elements, self.sphere_channels
-        )
-
-        # charge / spin embedding
-        self.charge_embedding = ChgSpinEmbedding(
-            self.chg_spin_emb_type,
-            "charge",
-            self.sphere_channels,
-            grad=self.cs_emb_grad,
-        )
-        self.spin_embedding = ChgSpinEmbedding(
-            self.chg_spin_emb_type,
-            "spin",
-            self.sphere_channels,
-            grad=self.cs_emb_grad,
-        )
-
-        # dataset embedding
-        if self.use_dataset_embedding:
-            self.dataset_embedding = DatasetEmbedding(
-                self.sphere_channels,
-                grad=self.dataset_emb_grad,
-                dataset_list=self.dataset_list,
-            )
-            # mix charge, spin, dataset embeddings
-            self.mix_csd = nn.Linear(3 * self.sphere_channels, self.sphere_channels)
-        else:
-            # mix charge, spin
-            self.mix_csd = nn.Linear(2 * self.sphere_channels, self.sphere_channels)
-
-        # edge distance embedding
-        self.cutoff = cutoff
-        self.edge_channels = edge_channels
-        self.distance_function = distance_function
-        self.num_distance_basis = num_distance_basis
-
-        if self.distance_function == "gaussian":
-            self.distance_expansion = GaussianSmearing(
-                0.0,
-                self.cutoff,
-                self.num_distance_basis,
-                2.0,
-            )
-        else:
-            raise ValueError("Unknown distance function")
-
-        # equivariant initial embedding
-        self.source_embedding = nn.Embedding(self.max_num_elements, self.edge_channels)
-        self.target_embedding = nn.Embedding(self.max_num_elements, self.edge_channels)
-        nn.init.uniform_(self.source_embedding.weight.data, -0.001, 0.001)
-        nn.init.uniform_(self.target_embedding.weight.data, -0.001, 0.001)
-
-        self.edge_channels_list = [
-            self.num_distance_basis + 2 * self.edge_channels,
-            self.edge_channels,
-            self.edge_channels,
-        ]
-
-        self.edge_degree_embedding = EdgeDegreeEmbedding(
-            sphere_channels=self.sphere_channels,
-            lmax=self.lmax,
-            mmax=self.mmax,
-            edge_channels_list=self.edge_channels_list,
-            rescale_factor=5.0,  # NOTE: sqrt avg degree
-            mappingReduced=self.mappingReduced,
-            activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
-        )
-
-        self.envelope = PolynomialEnvelope(exponent=5)
-
-        self.num_layers = num_layers
-        self.hidden_channels = hidden_channels
-        self.norm_type = norm_type
-        self.act_type = act_type
-        self.ff_type = ff_type
-        # LR
-        self.hidden_channels_lr = hidden_channels_lr
-        self.heisenberg_tf = heisenberg_tf
-        self.latent_charge_tf = latent_charge_tf
-        self.return_bec = return_bec
-        self.conv_function_tf = conv_function_tf
-        self.lr_output_scaling_factor = lr_output_scaling_factor
-        self.normalize_charges_tf = normalize_charges_tf
-        self.equil_charges_tf = equil_charges_tf
-        self.use_ewald_tf = use_ewald_tf
-
-        if cutoff_lr < 0.0:
-            self.cutoff_lr = cutoff
-        else:
-            self.cutoff_lr = cutoff_lr
-        
-        # Initialize the blocks for each layer
-        self.blocks = nn.ModuleList()
-        for _ in range(self.num_layers):
-            block = eSCNMD_Block(
-                self.sphere_channels,
-                self.hidden_channels,
-                self.lmax,
-                self.mmax,
-                self.mappingReduced,
-                self.SO3_grid,
-                self.edge_channels_list,
-                self.cutoff,
-                self.norm_type,
-                self.act_type,
-                self.ff_type,
-                activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
-            )
-            self.blocks.append(block)
-
-        self.norm = get_normalization_layer(
-            self.norm_type,
-            lmax=self.lmax,
-            num_channels=self.sphere_channels,
-        )
-
-        coefficient_index = self.SO3_grid["lmax_lmax"].mapping.coefficient_idx(
-            self.lmax, self.mmax
-        )
-        self.register_buffer("coefficient_index", coefficient_index, persistent=False)
-
-    def _get_rotmat_and_wigner(
-        self, edge_distance_vecs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Jd_buffers = [
-            getattr(self, f"Jd_{l}").type(edge_distance_vecs.dtype)
-            for l in range(self.lmax + 1)
-        ]
-
-        with record_function("obtain rotmat wigner original"):
-            euler_angles = init_edge_rot_euler_angles(edge_distance_vecs)
-            wigner = eulers_to_wigner(
-                euler_angles,
-                0,
-                self.lmax,
-                Jd_buffers,
-            )
-            wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
-
-        # select subset of coefficients we are using
-        if self.mmax != self.lmax:
-            wigner = wigner.index_select(1, self.coefficient_index)
-            wigner_inv = wigner_inv.index_select(2, self.coefficient_index)
-
-        wigner_and_M_mapping = torch.einsum(
-            "mk,nkj->nmj", self.mappingReduced.to_m.to(wigner.dtype), wigner
-        )
-        wigner_and_M_mapping_inv = torch.einsum(
-            "njk,mk->njm", wigner_inv, self.mappingReduced.to_m.to(wigner_inv.dtype)
-        )
-        return wigner_and_M_mapping, wigner_and_M_mapping_inv
-
-    def _get_displacement_and_cell(
-        self, data_dict: AtomicData
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        ###############################################################
-        # gradient-based forces/stress
-        ###############################################################
-        displacement = None
-        orig_cell = None
-        if self.regress_stress and not self.direct_forces:
-            displacement = torch.zeros(
-                (3, 3),
-                dtype=data_dict["pos"].dtype,
-                device=data_dict["pos"].device,
-            )
-            num_batch = len(data_dict["natoms"])
-            displacement = displacement.view(-1, 3, 3).expand(num_batch, 3, 3)
-            displacement.requires_grad = True
-            symmetric_displacement = 0.5 * (
-                displacement + displacement.transpose(-1, -2)
-            )
-            if data_dict["pos"].requires_grad is False:
-                data_dict["pos"].requires_grad = True
-            data_dict["pos_original"] = data_dict["pos"]
-            data_dict["pos"] = data_dict["pos"] + torch.bmm(
-                data_dict["pos"].unsqueeze(-2),
-                torch.index_select(symmetric_displacement, 0, data_dict["batch"]),
-            ).squeeze(-2)
-
-            orig_cell = data_dict["cell"]
-            data_dict["cell"] = data_dict["cell"] + torch.bmm(
-                data_dict["cell"], symmetric_displacement
-            )
-
-        if (
-            not self.regress_stress
-            and self.regress_forces
-            and not self.direct_forces
-            and data_dict["pos"].requires_grad is False
-        ):
-            data_dict["pos"].requires_grad = True
-        return displacement, orig_cell
-
-    def csd_embedding(self, charge, spin, dataset):
-        with record_function("charge spin dataset embeddings"):
-            # Add charge, spin, and dataset embeddings
-            chg_emb = self.charge_embedding(charge)
-            spin_emb = self.spin_embedding(spin)
-            if self.use_dataset_embedding:
-                assert dataset is not None
-                dataset_emb = self.dataset_embedding(dataset)
-                return torch.nn.SiLU()(
-                    self.mix_csd(torch.cat((chg_emb, spin_emb, dataset_emb), dim=1))
-                )
-            return torch.nn.SiLU()(self.mix_csd(torch.cat((chg_emb, spin_emb), dim=1)))
-
-    def _generate_graph(self, data_dict):
-        if self.otf_graph:
-            pbc = None
-            if self.always_use_pbc:
-                pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
-            else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
-                pbc = data_dict["pbc"]
-            assert pbc.all() or (~pbc).all(), (
-                "We can only accept pbc that is all true or all false"
-            )
-            logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
-            
-            graph_dict = generate_graph(
-                data_dict,
-                cutoff=self.cutoff,
-                max_neighbors=self.max_neighbors,
-                enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
-                radius_pbc_version=self.radius_pbc_version,
-                pbc=pbc,
-                cutoff_lr=self.cutoff_lr
-            )
-        else:
-            # this assume edge_index is provided
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
-            cell_per_edge = data_dict["cell"].repeat_interleave(
-                data_dict["nedges"], dim=0
-            )
-            shifts = torch.einsum(
-                "ij,ijk->ik",
-                data_dict["cell_offsets"].to(cell_per_edge.dtype),
-                cell_per_edge,
-            )
-            edge_distance_vec = (
-                data_dict["pos"][data_dict["edge_index"][0]]
-                - data_dict["pos"][data_dict["edge_index"][1]]
-                + shifts
-            )  # [n_edges, 3]
-            # pylint: disable=E1102
-            edge_distance = torch.linalg.norm(
-                edge_distance_vec, dim=-1, keepdim=False
-            )  # [n_edges, 1]
-
-            graph_dict = {
-                "edge_index": data_dict["edge_index"],
-                "edge_distance": edge_distance,
-                "edge_distance_vec": edge_distance_vec,
-            }
-        graph_dict["node_offset"] = 0  # default value
-
-        if gp_utils.initialized():
-            graph_dict = self._init_gp_partitions(
-                graph_dict, data_dict["atomic_numbers_full"]
-            )
-            # create partial atomic numbers and batch tensors for GP
-            data_dict["atomic_numbers"] = data_dict["atomic_numbers_full"][
-                graph_dict["node_partition"]
-            ]
-            data_dict["batch"] = data_dict["batch_full"][graph_dict["node_partition"]]
-
-        return graph_dict
-
-
-    @conditional_grad(torch.enable_grad())
-    def forward(self, data_dict: AtomicData) -> dict[str, torch.Tensor]:
-        data_dict["atomic_numbers"] = data_dict["atomic_numbers"].long()
-        data_dict["atomic_numbers_full"] = data_dict["atomic_numbers"]
-        data_dict["batch_full"] = data_dict["batch"]
-
-        csd_mixed_emb = self.csd_embedding(
-            charge=data_dict["charge"],
-            spin=data_dict["spin"],
-            dataset=data_dict.get("dataset", default=None),
-        )
-
-        self.set_MOLE_coefficients(
-            atomic_numbers_full=data_dict["atomic_numbers_full"],
-            batch_full=data_dict["batch_full"],
-            csd_mixed_emb=csd_mixed_emb,
-        )
-
-        with record_function("get_displacement_and_cell"):
-            displacement, orig_cell = self._get_displacement_and_cell(data_dict)
-
-        with record_function("generate_graph"):
-            graph_dict = self._generate_graph(data_dict)
-
-        if graph_dict["edge_index"].numel() == 0:
-            raise ValueError(
-                f"No edges found in input system, this means either you have a single atom in the system or the atoms are farther apart than the radius cutoff of the model of {self.cutoff} Angstroms. We don't know how to handle this case. Check the positions of system: {data_dict['pos']}"
-            )
-
-        with record_function("obtain wigner"):
-            (wigner_and_M_mapping, wigner_and_M_mapping_inv) = (
-                self._get_rotmat_and_wigner(
-                    graph_dict["edge_distance_vec"],
-                )
-            )
-
-        ###############################################################
-        # Initialize node embeddings
-        ###############################################################
-
-        # Init per node representations using an atomic number based embedding
-        with record_function("atom embedding"):
-            x_message = torch.zeros(
-                data_dict["atomic_numbers"].shape[0],
-                self.sph_feature_size,
-                self.sphere_channels,
-                device=data_dict["pos"].device,
-                dtype=data_dict["pos"].dtype,
-            )
-            x_message[:, 0, :] = self.sphere_embedding(data_dict["atomic_numbers"])
-
-        sys_node_embedding = csd_mixed_emb[data_dict["batch"]]
-        x_message[:, 0, :] = x_message[:, 0, :] + sys_node_embedding
-
-        ###
-        # Hook to allow MOLE
-        ###
-        self.set_MOLE_sizes(
-            nsystems=csd_mixed_emb.shape[0],
-            batch_full=data_dict["batch_full"],
-            edge_index=graph_dict["edge_index"],
-        )
-        self.log_MOLE_stats()
-
-        # edge degree embedding
-        with record_function("edge embedding"):
-            dist_scaled = graph_dict["edge_distance"] / self.cutoff
-            edge_envelope = self.envelope(dist_scaled).reshape(-1, 1, 1)
-            edge_distance_embedding = self.distance_expansion(
-                graph_dict["edge_distance"]
-            )
-            source_embedding = self.source_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]
-            )
-            target_embedding = self.target_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]
-            )
-            x_edge = torch.cat(
-                (edge_distance_embedding, source_embedding, target_embedding), dim=1
-            )
-            x_message = self.edge_degree_embedding(
-                x_message,
-                x_edge,
-                graph_dict["edge_index"],
-                wigner_and_M_mapping_inv,
-                edge_envelope,
-                graph_dict["node_offset"],
-            )
-        ###############################################################
-        # Update spherical node embeddings
-        ###############################################################
-        for i in range(self.num_layers):
-            with record_function(f"message passing {i}"):
-                x_message = self.blocks[i](
-                    x_message,
-                    x_edge,
-                    graph_dict["edge_distance"],
-                    graph_dict["edge_index"],
-                    wigner_and_M_mapping,
-                    wigner_and_M_mapping_inv,
-                    edge_envelope,
-                    sys_node_embedding=sys_node_embedding,
-                    node_offset=graph_dict["node_offset"],
-                )
-
-        # Final layer norm
-        x_message = self.norm(x_message)
-        out = {
-            "node_embedding": x_message,
-            "displacement": displacement,
-            "orig_cell": orig_cell,
-            "batch": data_dict["batch"],
-        }
-
-        if self.cutoff_lr is not None:
-            out["edge_index_lr"] = graph_dict["edge_index_lr"]
-
-        return out
-
-    def _init_gp_partitions(self, graph_dict, atomic_numbers_full):
-        """Graph Parallel
-        This creates the required partial tensors for each rank given the full tensors.
-        The tensors are split on the dimension along the node index using node_partition.
+    def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         """
-        edge_index = graph_dict["edge_index"]
+        UMA-specific validation: handle charge/spin for OMOL task.
 
-        node_partition = torch.tensor_split(
-            torch.arange(len(atomic_numbers_full)).to(atomic_numbers_full.device),
-            gp_utils.get_gp_world_size(),
-        )[gp_utils.get_gp_rank()]
-
-        assert node_partition.numel() > 0, (
-            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
-        )
-        edge_partition = torch.where(
-            torch.logical_and(
-                edge_index[1] >= node_partition.min(),
-                edge_index[1] <= node_partition.max(),  # TODO: 0 or 1?
-            )
-        )[0]
-        graph_dict["node_offset"] = node_partition.min().item()
-        graph_dict["node_partition"] = node_partition
-        # gp versions of data
-        graph_dict["edge_index"] = edge_index[:, edge_partition]
-        graph_dict["edge_distance"] = graph_dict["edge_distance"][edge_partition]
-        graph_dict["edge_distance_vec"] = graph_dict["edge_distance_vec"][
-            edge_partition
-        ]
-        return graph_dict
-
-    @property
-    def num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-    @torch.jit.ignore
-    def no_weight_decay(self) -> set:
-        no_wd_list = []
-        named_parameters_list = [name for name, _ in self.named_parameters()]
-        for module_name, module in self.named_modules():
-            if isinstance(
-                module,
-                (
-                    torch.nn.Linear,
-                    SO3_Linear,
-                    torch.nn.LayerNorm,
-                    EquivariantLayerNormArray,
-                    EquivariantLayerNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonicsV2,
-                ),
-            ):
-                for parameter_name, _ in module.named_parameters():
-                    if (
-                        isinstance(module, (torch.nn.Linear, SO3_Linear))
-                        and "weight" in parameter_name
-                    ):
-                        continue
-                    global_parameter_name = module_name + "." + parameter_name
-                    assert global_parameter_name in named_parameters_list
-                    no_wd_list.append(global_parameter_name)
-
-        return set(no_wd_list)
-
-
-@registry.register_model("escnmd_backbone_lr")
-class eSCNMDBackboneLR(nn.Module, MOLEInterface):
-    def __init__(
-        self,
-        max_num_elements: int = 100,
-        sphere_channels: int = 128,
-        lmax: int = 2,
-        mmax: int = 2,
-        grid_resolution: int | None = None,
-        num_sphere_samples: int = 128,  # NOTE not used
-        # NOTE: graph construction related, to remove
-        otf_graph: bool = False,
-        max_neighbors: int = 300,
-        use_pbc: bool = True,  # deprecated
-        use_pbc_single: bool = True,  # deprecated
-        cutoff: float = 5.0,
-        edge_channels: int = 128,
-        distance_function: Literal["gaussian"] = "gaussian",
-        num_distance_basis: int = 512,
-        direct_forces: bool = True,
-        regress_forces: bool = True,
-        regress_stress: bool = False,
-        # escnmd specific
-        num_layers: int = 2,
-        hidden_channels: int = 128,
-        norm_type: str = "rms_norm_sh",
-        act_type: str = "gate",
-        ff_type: str = "grid",
-        activation_checkpointing: bool = False,
-        chg_spin_emb_type: Literal["pos_emb", "lin_emb", "rand_emb"] = "pos_emb",
-        cs_emb_grad: bool = False,
-        dataset_emb_grad: bool = False,
-        dataset_list: list[str] | None = None,
-        use_dataset_embedding: bool = True,
-        radius_pbc_version: int = 1,
-        always_use_pbc: bool = True,
-        hidden_channels_lr: int = 64,  # extra for LR
-        heisenberg_tf: bool = False,  # extra for LR
-        latent_charge_tf: bool = True,  # extra for LR
-        return_bec: bool = False,  # TODO: change back
-        conv_function_tf: bool = True,  # extra for LR
-        lr_output_scaling_factor: float = 1.0, # extra for LR
-        cutoff_lr: float = -1.0,  # extra for LR, -1 means the sr cutoff is used for electrostatics/magnetic terms
-        normalize_charges_tf: bool = True,  # extra for LR
-        equil_charges_tf: bool = False,  # extra for LR
-        use_ewald_tf: bool = False,  # extra for LR
-    ) -> None:
-        super().__init__()
-        self.max_num_elements = max_num_elements
-        self.lmax = lmax
-        self.mmax = mmax
-        self.sphere_channels = sphere_channels
-        self.grid_resolution = grid_resolution
-        self.num_sphere_samples = num_sphere_samples
-        # set this True if we want to ALWAYS use pbc for internal graph gen
-        # despite what's in the input data this only affects when otf_graph is True
-        # in this mode, the user must be responsible for providing a large vaccum box
-        # for aperiodic systems
-        self.always_use_pbc = always_use_pbc
-
-        # energy conservation related
-        self.regress_forces = regress_forces
-        self.direct_forces = direct_forces
-        self.regress_stress = regress_stress
-
-        # NOTE: graph construction related, to remove, except for cutoff
-        self.otf_graph = otf_graph
-        self.max_neighbors = max_neighbors
-        self.radius_pbc_version = radius_pbc_version
-        self.enforce_max_neighbors_strictly = False
-
-        activation_checkpoint_chunk_size = None
-        if activation_checkpointing:
-            # The size of edge blocks to use in activation checkpointing
-            activation_checkpoint_chunk_size = ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE
-
-        # related to charge spin dataset system embedding
-        self.chg_spin_emb_type = chg_spin_emb_type
-        self.cs_emb_grad = cs_emb_grad
-        self.dataset_emb_grad = dataset_emb_grad
-        self.dataset_list = dataset_list
-        self.use_dataset_embedding = use_dataset_embedding
-        if self.use_dataset_embedding:
-            assert (
-                self.dataset_list
-            ), "the dataset list is empty, please add it to the model backbone config"
-
-
-        # rotation utils
-        Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
-        for l in range(self.lmax + 1):
-            self.register_buffer(f"Jd_{l}", Jd_list[l])
-        self.sph_feature_size = int((self.lmax + 1) ** 2)
-        self.mappingReduced = CoefficientMapping(self.lmax, self.mmax)
-
-        # lmax_lmax for node, lmax_mmax for edge
-        self.SO3_grid = nn.ModuleDict()
-        self.SO3_grid["lmax_lmax"] = SO3_Grid(
-            self.lmax, self.lmax, resolution=grid_resolution, rescale=True
-        )
-        self.SO3_grid["lmax_mmax"] = SO3_Grid(
-            self.lmax, self.mmax, resolution=grid_resolution, rescale=True
-        )
-
-        # atom embedding
-        self.sphere_embedding = nn.Embedding(
-            self.max_num_elements, self.sphere_channels
-        )
-
-        # charge / spin embedding
-        self.charge_embedding = ChgSpinEmbedding(
-            self.chg_spin_emb_type,
-            "charge",
-            self.sphere_channels,
-            grad=self.cs_emb_grad,
-        )
-        self.spin_embedding = ChgSpinEmbedding(
-            self.chg_spin_emb_type,
-            "spin",
-            self.sphere_channels,
-            grad=self.cs_emb_grad,
-        )
-
-        # dataset embedding
-        if self.use_dataset_embedding:
-            self.dataset_embedding = DatasetEmbedding(
-                self.sphere_channels,
-                grad=self.dataset_emb_grad,
-                dataset_list=self.dataset_list,
-            )
-            # mix charge, spin, dataset embeddings
-            self.mix_csd = nn.Linear(3 * self.sphere_channels, self.sphere_channels)
-        else:
-            # mix charge, spin
-            self.mix_csd = nn.Linear(2 * self.sphere_channels, self.sphere_channels)
-
-        # edge distance embedding
-        self.cutoff = cutoff
-        self.edge_channels = edge_channels
-        self.distance_function = distance_function
-        self.num_distance_basis = num_distance_basis
-
-        if self.distance_function == "gaussian":
-            self.distance_expansion = GaussianSmearing(
-                0.0,
-                self.cutoff,
-                self.num_distance_basis,
-                2.0,
-            )
-        else:
-            raise ValueError("Unknown distance function")
-
-        # equivariant initial embedding
-        self.source_embedding = nn.Embedding(self.max_num_elements, self.edge_channels)
-        self.target_embedding = nn.Embedding(self.max_num_elements, self.edge_channels)
-        nn.init.uniform_(self.source_embedding.weight.data, -0.001, 0.001)
-        nn.init.uniform_(self.target_embedding.weight.data, -0.001, 0.001)
-
-        self.edge_channels_list = [
-            self.num_distance_basis + 2 * self.edge_channels,
-            self.edge_channels,
-            self.edge_channels,
-        ]
-
-        self.edge_degree_embedding = EdgeDegreeEmbedding(
-            sphere_channels=self.sphere_channels,
-            lmax=self.lmax,
-            mmax=self.mmax,
-            edge_channels_list=self.edge_channels_list,
-            rescale_factor=5.0,  # NOTE: sqrt avg degree
-            mappingReduced=self.mappingReduced,
-            activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
-        )
-
-        self.envelope = PolynomialEnvelope(exponent=5)
-
-        self.num_layers = num_layers
-        self.hidden_channels = hidden_channels
-        self.norm_type = norm_type
-        self.act_type = act_type
-        self.ff_type = ff_type
-        # LR
-        self.hidden_channels_lr = hidden_channels_lr
-        self.heisenberg_tf = heisenberg_tf
-        self.latent_charge_tf = latent_charge_tf
-        self.return_bec = return_bec
-        self.conv_function_tf = conv_function_tf
-        self.lr_output_scaling_factor = lr_output_scaling_factor
-        self.normalize_charges_tf = normalize_charges_tf
-        self.equil_charges_tf = equil_charges_tf
-        self.use_ewald_tf = use_ewald_tf
-
-        if cutoff_lr < 0.0:
-            self.cutoff_lr = cutoff
-        else:
-            self.cutoff_lr = cutoff_lr
-        
-        # Initialize the blocks for each layer
-        self.blocks = nn.ModuleList()
-        for _ in range(self.num_layers):
-            block = eSCNMD_Block(
-                self.sphere_channels,
-                self.hidden_channels,
-                self.lmax,
-                self.mmax,
-                self.mappingReduced,
-                self.SO3_grid,
-                self.edge_channels_list,
-                self.cutoff,
-                self.norm_type,
-                self.act_type,
-                self.ff_type,
-                activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
-            )
-            self.blocks.append(block)
-
-        self.norm = get_normalization_layer(
-            self.norm_type,
-            lmax=self.lmax,
-            num_channels=self.sphere_channels,
-        )
-
-        coefficient_index = self.SO3_grid["lmax_lmax"].mapping.coefficient_idx(
-            self.lmax, self.mmax
-        )
-        self.register_buffer("coefficient_index", coefficient_index, persistent=False)
-
-    def _get_rotmat_and_wigner(
-        self, edge_distance_vecs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Jd_buffers = [
-            getattr(self, f"Jd_{l}").type(edge_distance_vecs.dtype)
-            for l in range(self.lmax + 1)
-        ]
-
-        with record_function("obtain rotmat wigner original"):
-            euler_angles = init_edge_rot_euler_angles(edge_distance_vecs)
-            wigner = eulers_to_wigner(
-                euler_angles,
-                0,
-                self.lmax,
-                Jd_buffers,
-            )
-            wigner_inv = torch.transpose(wigner, 1, 2).contiguous()
-
-        # select subset of coefficients we are using
-        if self.mmax != self.lmax:
-            wigner = wigner.index_select(1, self.coefficient_index)
-            wigner_inv = wigner_inv.index_select(2, self.coefficient_index)
-
-        wigner_and_M_mapping = torch.einsum(
-            "mk,nkj->nmj", self.mappingReduced.to_m.to(wigner.dtype), wigner
-        )
-        wigner_and_M_mapping_inv = torch.einsum(
-            "njk,mk->njm", wigner_inv, self.mappingReduced.to_m.to(wigner_inv.dtype)
-        )
-        return wigner_and_M_mapping, wigner_and_M_mapping_inv
-
-    def _get_displacement_and_cell(
-        self, data_dict: AtomicData
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        ###############################################################
-        # gradient-based forces/stress
-        ###############################################################
-        displacement = None
-        orig_cell = None
-        if self.regress_stress and not self.direct_forces:
-            displacement = torch.zeros(
-                (3, 3),
-                dtype=data_dict["pos"].dtype,
-                device=data_dict["pos"].device,
-            )
-            num_batch = len(data_dict["natoms"])
-            displacement = displacement.view(-1, 3, 3).expand(num_batch, 3, 3)
-            displacement.requires_grad = True
-            symmetric_displacement = 0.5 * (
-                displacement + displacement.transpose(-1, -2)
-            )
-            if data_dict["pos"].requires_grad is False:
-                data_dict["pos"].requires_grad = True
-            data_dict["pos_original"] = data_dict["pos"]
-            data_dict["pos"] = data_dict["pos"] + torch.bmm(
-                data_dict["pos"].unsqueeze(-2),
-                torch.index_select(symmetric_displacement, 0, data_dict["batch"]),
-            ).squeeze(-2)
-
-            orig_cell = data_dict["cell"]
-            data_dict["cell"] = data_dict["cell"] + torch.bmm(
-                data_dict["cell"], symmetric_displacement
-            )
-
-        if (
-            not self.regress_stress
-            and self.regress_forces
-            and not self.direct_forces
-            and data_dict["pos"].requires_grad is False
-        ):
-            data_dict["pos"].requires_grad = True
-        return displacement, orig_cell
-
-    def csd_embedding(self, charge, spin, dataset):
-        with record_function("charge spin dataset embeddings"):
-            # Add charge, spin, and dataset embeddings
-            chg_emb = self.charge_embedding(charge)
-            spin_emb = self.spin_embedding(spin)
-            if self.use_dataset_embedding:
-                assert dataset is not None
-                dataset_emb = self.dataset_embedding(dataset)
-                return torch.nn.SiLU()(
-                    self.mix_csd(torch.cat((chg_emb, spin_emb, dataset_emb), dim=1))
-                )
-            return torch.nn.SiLU()(self.mix_csd(torch.cat((chg_emb, spin_emb), dim=1)))
-
-    def _generate_graph(self, data_dict):
-        if self.otf_graph:
-            pbc = None
-            if self.always_use_pbc:
-                pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
-            else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
-                pbc = data_dict["pbc"]
-            assert pbc.all() or (~pbc).all(), (
-                "We can only accept pbc that is all true or all false"
-            )
-            logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
-            
-            graph_dict = generate_graph(
-                data_dict,
-                cutoff=self.cutoff,
-                max_neighbors=self.max_neighbors,
-                enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
-                radius_pbc_version=self.radius_pbc_version,
-                pbc=pbc,
-                cutoff_lr=self.cutoff_lr
-            )
-        else:
-            # this assume edge_index is provided
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
-            cell_per_edge = data_dict["cell"].repeat_interleave(
-                data_dict["nedges"], dim=0
-            )
-            shifts = torch.einsum(
-                "ij,ijk->ik",
-                data_dict["cell_offsets"].to(cell_per_edge.dtype),
-                cell_per_edge,
-            )
-            edge_distance_vec = (
-                data_dict["pos"][data_dict["edge_index"][0]]
-                - data_dict["pos"][data_dict["edge_index"][1]]
-                + shifts
-            )  # [n_edges, 3]
-            # pylint: disable=E1102
-            edge_distance = torch.linalg.norm(
-                edge_distance_vec, dim=-1, keepdim=False
-            )  # [n_edges, 1]
-
-            graph_dict = {
-                "edge_index": data_dict["edge_index"],
-                "edge_distance": edge_distance,
-                "edge_distance_vec": edge_distance_vec,
-            }
-        graph_dict["node_offset"] = 0  # default value
-
-        if gp_utils.initialized():
-            graph_dict = self._init_gp_partitions(
-                graph_dict, data_dict["atomic_numbers_full"]
-            )
-            # create partial atomic numbers and batch tensors for GP
-            data_dict["atomic_numbers"] = data_dict["atomic_numbers_full"][
-                graph_dict["node_partition"]
-            ]
-            data_dict["batch"] = data_dict["batch_full"][graph_dict["node_partition"]]
-
-        return graph_dict
-
-
-    @conditional_grad(torch.enable_grad())
-    def forward(self, data_dict: AtomicData) -> dict[str, torch.Tensor]:
-        data_dict["atomic_numbers"] = data_dict["atomic_numbers"].long()
-        data_dict["atomic_numbers_full"] = data_dict["atomic_numbers"]
-        data_dict["batch_full"] = data_dict["batch"]
-
-        csd_mixed_emb = self.csd_embedding(
-            charge=data_dict["charge"],
-            spin=data_dict["spin"],
-            dataset=data_dict.get("dataset", default=None),
-        )
-
-        self.set_MOLE_coefficients(
-            atomic_numbers_full=data_dict["atomic_numbers_full"],
-            batch_full=data_dict["batch_full"],
-            csd_mixed_emb=csd_mixed_emb,
-        )
-
-        with record_function("get_displacement_and_cell"):
-            displacement, orig_cell = self._get_displacement_and_cell(data_dict)
-
-        with record_function("generate_graph"):
-            graph_dict = self._generate_graph(data_dict)
-
-        if graph_dict["edge_index"].numel() == 0:
-            raise ValueError(
-                f"No edges found in input system, this means either you have a single atom in the system or the atoms are farther apart than the radius cutoff of the model of {self.cutoff} Angstroms. We don't know how to handle this case. Check the positions of system: {data_dict['pos']}"
-            )
-
-        with record_function("obtain wigner"):
-            (wigner_and_M_mapping, wigner_and_M_mapping_inv) = (
-                self._get_rotmat_and_wigner(
-                    graph_dict["edge_distance_vec"],
-                )
-            )
-
-        ###############################################################
-        # Initialize node embeddings
-        ###############################################################
-
-        # Init per node representations using an atomic number based embedding
-        with record_function("atom embedding"):
-            x_message = torch.zeros(
-                data_dict["atomic_numbers"].shape[0],
-                self.sph_feature_size,
-                self.sphere_channels,
-                device=data_dict["pos"].device,
-                dtype=data_dict["pos"].dtype,
-            )
-            x_message[:, 0, :] = self.sphere_embedding(data_dict["atomic_numbers"])
-
-        sys_node_embedding = csd_mixed_emb[data_dict["batch"]]
-        x_message[:, 0, :] = x_message[:, 0, :] + sys_node_embedding
-
-        ###
-        # Hook to allow MOLE
-        ###
-        self.set_MOLE_sizes(
-            nsystems=csd_mixed_emb.shape[0],
-            batch_full=data_dict["batch_full"],
-            edge_index=graph_dict["edge_index"],
-        )
-        self.log_MOLE_stats()
-
-        # edge degree embedding
-        with record_function("edge embedding"):
-            dist_scaled = graph_dict["edge_distance"] / self.cutoff
-            edge_envelope = self.envelope(dist_scaled).reshape(-1, 1, 1)
-            edge_distance_embedding = self.distance_expansion(
-                graph_dict["edge_distance"]
-            )
-            source_embedding = self.source_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]
-            )
-            target_embedding = self.target_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]
-            )
-            x_edge = torch.cat(
-                (edge_distance_embedding, source_embedding, target_embedding), dim=1
-            )
-            x_message = self.edge_degree_embedding(
-                x_message,
-                x_edge,
-                graph_dict["edge_index"],
-                wigner_and_M_mapping_inv,
-                edge_envelope,
-                graph_dict["node_offset"],
-            )
-        ###############################################################
-        # Update spherical node embeddings
-        ###############################################################
-        for i in range(self.num_layers):
-            with record_function(f"message passing {i}"):
-                x_message = self.blocks[i](
-                    x_message,
-                    x_edge,
-                    graph_dict["edge_distance"],
-                    graph_dict["edge_index"],
-                    wigner_and_M_mapping,
-                    wigner_and_M_mapping_inv,
-                    edge_envelope,
-                    sys_node_embedding=sys_node_embedding,
-                    node_offset=graph_dict["node_offset"],
-                )
-
-        # Final layer norm
-        x_message = self.norm(x_message)
-        out = {
-            "node_embedding": x_message,
-            "displacement": displacement,
-            "orig_cell": orig_cell,
-            "batch": data_dict["batch"],
-        }
-
-        if self.cutoff_lr is not None:
-            out["edge_index_lr"] = graph_dict["edge_index_lr"]
-
-        return out
-
-    def _init_gp_partitions(self, graph_dict, atomic_numbers_full):
-        """Graph Parallel
-        This creates the required partial tensors for each rank given the full tensors.
-        The tensors are split on the dimension along the node index using node_partition.
+        Sets default values for charge and spin in atoms.info and validates
+        they are within acceptable ranges.
         """
-        edge_index = graph_dict["edge_index"]
+        # Set charge defaults
+        if "charge" not in atoms.info:
+            if task_name == UMATask.OMOL.value:
+                logging.warning(
+                    "task_name='omol' detected, but charge is not set in atoms.info. "
+                    "Defaulting to charge=0. Ensure charge is an integer representing "
+                    "the total charge on the system and is within the range -100 to 100."
+                )
+            atoms.info["charge"] = DEFAULT_CHARGE
 
-        node_partition = torch.tensor_split(
-            torch.arange(len(atomic_numbers_full)).to(atomic_numbers_full.device),
-            gp_utils.get_gp_world_size(),
-        )[gp_utils.get_gp_rank()]
+        # Set spin defaults (OMOL uses spin=1, others use spin=0)
+        if "spin" not in atoms.info:
+            if task_name == UMATask.OMOL.value:
+                atoms.info["spin"] = DEFAULT_SPIN_OMOL
+                logging.warning(
+                    "task_name='omol' detected, but spin multiplicity is not set in "
+                    "atoms.info. Defaulting to spin=1. Ensure spin is an integer "
+                    "representing the spin multiplicity from 0 to 100."
+                )
+            else:
+                atoms.info["spin"] = DEFAULT_SPIN
 
-        assert node_partition.numel() > 0, (
-            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
-        )
-        edge_partition = torch.where(
-            torch.logical_and(
-                edge_index[1] >= node_partition.min(),
-                edge_index[1] <= node_partition.max(),  # TODO: 0 or 1?
+        # Validate charge range
+        charge = atoms.info["charge"]
+        if not isinstance(charge, (int, np.integer)):
+            raise TypeError(
+                f"Invalid type for charge: {type(charge)}. "
+                "Charge must be an integer representing the total charge on the system."
             )
-        )[0]
-        graph_dict["node_offset"] = node_partition.min().item()
-        graph_dict["node_partition"] = node_partition
-        # gp versions of data
-        graph_dict["edge_index"] = edge_index[:, edge_partition]
-        graph_dict["edge_distance"] = graph_dict["edge_distance"][edge_partition]
-        graph_dict["edge_distance_vec"] = graph_dict["edge_distance_vec"][
-            edge_partition
-        ]
+        if not (CHARGE_RANGE[0] <= charge <= CHARGE_RANGE[1]):
+            raise ValueError(
+                f"Invalid value for charge: {charge}. "
+                f"Charge must be within the range {CHARGE_RANGE[0]} to {CHARGE_RANGE[1]}."
+            )
 
-        return graph_dict
-
-    @property
-    def num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
-
-    @torch.jit.ignore
-    def no_weight_decay(self) -> set:
-        no_wd_list = []
-        named_parameters_list = [name for name, _ in self.named_parameters()]
-        for module_name, module in self.named_modules():
-            if isinstance(
-                module,
-                (
-                    torch.nn.Linear,
-                    SO3_Linear,
-                    torch.nn.LayerNorm,
-                    EquivariantLayerNormArray,
-                    EquivariantLayerNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonics,
-                    EquivariantRMSNormArraySphericalHarmonicsV2,
-                ),
-            ):
-                for parameter_name, _ in module.named_parameters():
-                    if (
-                        isinstance(module, (torch.nn.Linear, SO3_Linear))
-                        and "weight" in parameter_name
-                    ):
-                        continue
-                    global_parameter_name = module_name + "." + parameter_name
-                    assert global_parameter_name in named_parameters_list
-                    no_wd_list.append(global_parameter_name)
-
-        return set(no_wd_list)
+        # Validate spin range
+        spin = atoms.info["spin"]
+        if not isinstance(spin, (int, np.integer)):
+            raise TypeError(
+                f"Invalid type for spin: {type(spin)}. "
+                "Spin must be an integer representing the spin multiplicity."
+            )
+        if not (SPIN_RANGE[0] <= spin <= SPIN_RANGE[1]):
+            raise ValueError(
+                f"Invalid value for spin: {spin}. "
+                f"Spin must be within the range {SPIN_RANGE[0]} to {SPIN_RANGE[1]}."
+            )
 
 
-@registry.register_model("esen_efs_head")
 class MLP_EFS_Head(nn.Module, HeadInterface):
+    """MLP head for predicting energy, forces, and stress using autograd derivatives.
+
+    This head computes forces and stress by taking gradients of the energy with respect to
+    atomic positions and cell displacement.
+    """
+
     def __init__(
         self,
         backbone: eSCNMDBackbone,
+        reduce: str = "sum",
         prefix: str | None = None,
         wrap_property: bool = True,
     ) -> None:
         super().__init__()
-        backbone.energy_block = None
-        backbone.force_block = None
-        self.regress_stress = backbone.regress_stress
-        self.regress_forces = backbone.regress_forces
+
+        self.reduce = reduce
         self.prefix = prefix
         self.wrap_property = wrap_property
 
@@ -1970,721 +1155,38 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
             nn.Linear(self.hidden_channels, 1, bias=True),
         )
 
-        # TODO: this is not very clean, bug-prone.
-        # but is currently necessary for finetuning pretrained models that did not have
-        # the direct_forces flag set to False
-        backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
-
-    @conditional_grad(torch.enable_grad())
-    def forward(
-        self, data: AtomicData, emb: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        if self.prefix:
-            energy_key = f"{self.prefix}_energy"
-            forces_key = f"{self.prefix}_forces"
-            stress_key = f"{self.prefix}_stress"
-        else:
-            energy_key = "energy"
-            forces_key = "forces"
-            stress_key = "stress"
-
-        outputs = {}
-        _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        _output = self.energy_block(_input)
-        node_energy = _output.view(-1, 1, 1)
-        energy_part = torch.zeros(
-            len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
-        )
-        energy_part.index_add_(0, data["batch"], node_energy.view(-1))
-
-        if gp_utils.initialized():
-            energy = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy = energy_part
-
-        outputs[energy_key] = {"energy": energy} if self.wrap_property else energy
-
-        if not gp_utils.initialized():
-            embeddings = emb["node_embedding"].detach()
-            outputs["embeddings"] = (
-                {"embeddings": embeddings} if self.wrap_property else embeddings
-            )
-
-        if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_part.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-            if gp_utils.initialized():
-                grads = (
-                    gp_utils.reduce_from_model_parallel_region(grads[0]),
-                    gp_utils.reduce_from_model_parallel_region(grads[1]),
-                )
-
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-            outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        
-        elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_part.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            if gp_utils.initialized():
-                forces = gp_utils.reduce_from_model_parallel_region(forces)
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-        return outputs
-
-
-@registry.register_model("esen_efs_head_lr")
-class MLP_EFS_Head_LR(nn.Module, HeadInterface):
-    def __init__(
-            self, 
-            backbone: eSCNMDBackboneLR, 
-            prefix: str | None = None, 
-            wrap_property: bool = True,
-    ) -> None:
-        super().__init__()
         backbone.energy_block = None
         backbone.force_block = None
-        self.regress_stress = backbone.regress_stress
-        self.regress_forces = backbone.regress_forces
-        self.prefix = prefix
-        self.wrap_property = wrap_property
-        self.return_bec = backbone.return_bec
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
+        self.regress_config = backbone.regress_config
 
-        self.sphere_channels = backbone.sphere_channels
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = (
-            backbone.hidden_channels_lr
-        )  # this might not be in the backbone
-        self.heisenberg_tf = backbone.heisenberg_tf
-        self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
+    @property
+    def regress_forces(self) -> bool:
+        return self.regress_config.forces
 
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
-        )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-
-        
-        # but is currently necessary for finetuning pretrained models that did not have
-        # the direct_forces flag set to False
-        backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
-
-    def get_charges(
-        self, 
-        node_features: torch.Tensor,
-        data: AtomicData, 
-        epsilon: float = 1e-8
-    ):
-        results = {}
-        with torch.enable_grad():  # Ensure gradients are enabled even during evaluation
-            charges_raw = self.q_output_lr(node_features)
-
-        if self.lr_comp_size == 1:
-            #charges_raw = charges_raw.abs()
-            results["charges"] = charges_raw.view(-1, 1, 1)  * self.lr_output_scaling_factor
-            
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1, 1, 1)   
-                results["electroneg"] = electroneg.view(-1, 1, 1)
-            
-            # TODO: renormalize charges if 
-            if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )
-                # renormalize charges
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                # renormalizes via division
-                charges_raw = true_charge_broadcasted * charges_raw / ( global_charges_broadcasted + epsilon)
-                results["charges"] = charges_raw
-                
-                """global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )"""
-                #print("renormalized global_charges: ", global_charges)
-
-        if self.lr_comp_size == 2:
-
-            # sum across components
-            charges_raw = charges_raw
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            results["charges_raw"] = charges_raw  * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-
-            if self.normalize_charges_tf:            
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise
-                ) # return [N_atoms, 2]
-
-                
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1) 
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1) 
-                
-        return results
-
-
-    def get_lr_energies(
-        self, 
-        emb: dict[str, torch.Tensor], 
-        data: AtomicData, 
-        return_charges: bool = False
-    ):        
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(), 
-            data
-        )
-        #print("data dict keys: ", data.keys())
-
-        if "edge_index_lr" in emb: 
-           edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        energy_output_lr_dict = potential_full_from_edge_inds(
-            edge_index=edges_lr,
-            pos=data["pos"],
-            q=charge_dict["charges"],
-            sigma=1.0,
-            epsilon=1e-6,
-            return_bec=False,
-            batch=data["batch"],
-            conv_function_tf=self.conv_function_tf,
-        )
-        
-
-        #################################### HACK REMOVE LATER ####################################
-        '''
-        sid = data.get("sid", None)
-        import numpy as np
-        import os
-        bec = energy_output_lr_dict['bec']
-        bec = bec.detach().cpu().numpy() if bec is not None else None
-        # save to numpy array
-        #print("bec_shape", bec.shape)
-        tag = "spice_spin_charge_constrain"
-        file_name = '{}.npy'.format(tag)
-        file_name_ids = '{}_ids.npy'.format(tag)
-        
-        if os.path.exists(file_name):
-            # append to the file
-            existing_bec = np.load(file_name)
-            bec = bec#.reshape(-1, 9)
-            #print("bec_shape", bec.shape, sid, positions.shape)
-            #bec = bec.reshape(-1, bec.shape[-1])
-            # make jagged array
-            
-            bec = np.concatenate((existing_bec, bec), axis=0)
-        else:
-            # create the file
-            bec = bec#.reshape(-1, 9)
-        
-        np.save(file_name, bec)
-
-        if os.path.exists(file_name_ids):
-            # append to the file
-            existing_ids = np.load(file_name_ids)
-            sid = sid#.reshape(-1, 1)
-            # append
-            #sid = sid.reshape(-1, 1) if sid is not None else None
-            if sid is not None:
-                sid = np.concatenate((existing_ids, sid), axis=0)
-    
-        
-        if sid is not None:
-            np.save(file_name_ids, sid)
-        '''
-        #################################### HACK REMOVE LATER ####################################
-
-        results["energy"] = energy_output_lr_dict["potential"]
-        
-        if self.equil_charges_tf:
-            en_electrostatic = (charge_dict["electroneg"] * charge_dict["charges"]).view(-1)
-            en_hardness = 0.5 * (charge_dict["hardness"] * charge_dict["charges"]**2).view(-1)
-            #print("en_electrostatic: ", en_electrostatic.shape)
-            #print("en_hardness: ", en_hardness.shape)
-            #print("energy_output_lr_dict[potential]: ", results["energy"].shape)
-            results["energy"] += en_electrostatic + en_hardness
-
-        if self.heisenberg_tf:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-                sigma=1.0,
-            )
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict["spin"]
-
-        return results
+    @property
+    def regress_stress(self) -> bool:
+        return self.regress_config.stress
 
     @conditional_grad(torch.enable_grad())
     def forward(
         self, data: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if self.prefix:
-            energy_key = f"{self.prefix}_energy"
-            forces_key = f"{self.prefix}_forces"
-            stress_key = f"{self.prefix}_stress"
-        else:
-            energy_key = "energy"
-            forces_key = "forces"
-            stress_key = "stress"
+        energy_key = f"{self.prefix}_energy" if self.prefix else "energy"
+        forces_key = f"{self.prefix}_forces" if self.prefix else "forces"
+        stress_key = f"{self.prefix}_stress" if self.prefix else "stress"
+        hessian_key = f"{self.prefix}_hessian" if self.prefix else "hessian"
 
         outputs = {}
-        _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        _output = self.energy_block(_input)
-        node_energy = _output.view(-1, 1, 1)
-        energy_part = torch.zeros(
-            len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
+
+        # Use shared energy computation from parent class
+        energy, energy_part = compute_energy(
+            emb,
+            self.energy_block,
+            data["batch"],
+            len(data["natoms"]),
+            natoms=data["natoms"],
+            reduce=self.reduce,
         )
-        energy_part.index_add_(0, data["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data)
-            energy_part.index_add_(0, data["batch"], lr_energy["energy"])
-        
-        if self.heisenberg_tf:
-            energy_part.index_add_(0, data["batch"], lr_energy["energy_spin"])
-
-        if gp_utils.initialized():
-            energy = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy = energy_part
-
-        outputs[energy_key] = {"energy": energy} if self.wrap_property else energy
-
-        if not gp_utils.initialized():
-            embeddings = emb["node_embedding"].detach()
-            outputs["embeddings"] = (
-                {"embeddings": embeddings} if self.wrap_property else embeddings
-            )
-        if not gp_utils.initialized():
-            embeddings = emb["node_embedding"].detach()
-            outputs["embeddings"] = (
-                {"embeddings": embeddings} if self.wrap_property else embeddings
-            )
-
-        if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_part.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-            if gp_utils.initialized():
-                grads = (
-                    gp_utils.reduce_from_model_parallel_region(grads[0]),
-                    gp_utils.reduce_from_model_parallel_region(grads[1]),
-                )
-
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-            outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        
-        elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_part.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            if gp_utils.initialized():
-                forces = gp_utils.reduce_from_model_parallel_region(forces)
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-        return outputs
-
-
-@registry.register_model("esen_efs_head_lr")
-class MLP_EFS_Head_LR(nn.Module, HeadInterface):
-    def __init__(
-            self, 
-            backbone: eSCNMDBackboneLR, 
-            prefix: str | None = None, 
-            wrap_property: bool = True,
-    ) -> None:
-        super().__init__()
-        backbone.energy_block = None
-        backbone.force_block = None
-        self.regress_stress = backbone.regress_stress
-        self.regress_forces = backbone.regress_forces
-        self.prefix = prefix
-        self.wrap_property = wrap_property
-        self.return_bec = backbone.return_bec
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-
-        self.sphere_channels = backbone.sphere_channels
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = (
-            backbone.hidden_channels_lr
-        )  # this might not be in the backbone
-        self.heisenberg_tf = backbone.heisenberg_tf
-        self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
-
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
-        )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-
-        
-        # but is currently necessary for finetuning pretrained models that did not have
-        # the direct_forces flag set to False
-        backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
-
-    def get_charges(
-        self, 
-        node_features: torch.Tensor,
-        data: AtomicData, 
-        epsilon: float = 1e-8
-    ):
-        results = {}
-        with torch.enable_grad():  # Ensure gradients are enabled even during evaluation
-            charges_raw = self.q_output_lr(node_features)
-
-        if self.lr_comp_size == 1:
-            #charges_raw = charges_raw.abs()
-            results["charges"] = charges_raw.view(-1, 1, 1)  * self.lr_output_scaling_factor
-            
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1, 1, 1)   
-                results["electroneg"] = electroneg.view(-1, 1, 1)
-            
-            # TODO: renormalize charges if 
-            if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )
-                # renormalize charges
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                # renormalizes via division
-                charges_raw = true_charge_broadcasted * charges_raw / ( global_charges_broadcasted + epsilon)
-                results["charges"] = charges_raw
-                
-                """global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )"""
-                #print("renormalized global_charges: ", global_charges)
-
-        if self.lr_comp_size == 2:
-
-            # sum across components
-            charges_raw = charges_raw
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            results["charges_raw"] = charges_raw  * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-
-            if self.normalize_charges_tf:            
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise
-                ) # return [N_atoms, 2]
-
-                
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1) 
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1) 
-                
-        return results
-
-
-    def get_lr_energies(
-        self, 
-        emb: dict[str, torch.Tensor], 
-        data: AtomicData, 
-        return_charges: bool = False
-    ):        
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(), 
-            data
-        )
-        #print("data dict keys: ", data.keys())
-
-        if "edge_index_lr" in emb: 
-           edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        energy_output_lr_dict = potential_full_from_edge_inds(
-            edge_index=edges_lr,
-            pos=data["pos"],
-            q=charge_dict["charges"],
-            sigma=1.0,
-            epsilon=1e-6,
-            return_bec=False,
-            batch=data["batch"],
-            conv_function_tf=self.conv_function_tf,
-        )
-        
-
-        #################################### HACK REMOVE LATER ####################################
-        '''
-        sid = data.get("sid", None)
-        import numpy as np
-        import os
-        bec = energy_output_lr_dict['bec']
-        bec = bec.detach().cpu().numpy() if bec is not None else None
-        # save to numpy array
-        #print("bec_shape", bec.shape)
-        tag = "spice_spin_charge_constrain"
-        file_name = '{}.npy'.format(tag)
-        file_name_ids = '{}_ids.npy'.format(tag)
-        
-        if os.path.exists(file_name):
-            # append to the file
-            existing_bec = np.load(file_name)
-            bec = bec#.reshape(-1, 9)
-            #print("bec_shape", bec.shape, sid, positions.shape)
-            #bec = bec.reshape(-1, bec.shape[-1])
-            # make jagged array
-            
-            bec = np.concatenate((existing_bec, bec), axis=0)
-        else:
-            # create the file
-            bec = bec#.reshape(-1, 9)
-        
-        np.save(file_name, bec)
-
-        if os.path.exists(file_name_ids):
-            # append to the file
-            existing_ids = np.load(file_name_ids)
-            sid = sid#.reshape(-1, 1)
-            # append
-            #sid = sid.reshape(-1, 1) if sid is not None else None
-            if sid is not None:
-                sid = np.concatenate((existing_ids, sid), axis=0)
-    
-        
-        if sid is not None:
-            np.save(file_name_ids, sid)
-        '''
-        #################################### HACK REMOVE LATER ####################################
-
-        results["energy"] = energy_output_lr_dict["potential"]
-        
-        if self.equil_charges_tf:
-            en_electrostatic = (charge_dict["electroneg"] * charge_dict["charges"]).view(-1)
-            en_hardness = 0.5 * (charge_dict["hardness"] * charge_dict["charges"]**2).view(-1)
-            #print("en_electrostatic: ", en_electrostatic.shape)
-            #print("en_hardness: ", en_hardness.shape)
-            #print("energy_output_lr_dict[potential]: ", results["energy"].shape)
-            results["energy"] += en_electrostatic + en_hardness
-
-        if self.heisenberg_tf:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-                sigma=1.0,
-            )
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict["spin"]
-
-        return results
-
-    @conditional_grad(torch.enable_grad())
-    def forward(
-        self, data: AtomicData, emb: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        if self.prefix:
-            energy_key = f"{self.prefix}_energy"
-            forces_key = f"{self.prefix}_forces"
-            stress_key = f"{self.prefix}_stress"
-        else:
-            energy_key = "energy"
-            forces_key = "forces"
-            stress_key = "stress"
-
-        outputs = {}
-        _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        _output = self.energy_block(_input)
-        node_energy = _output.view(-1, 1, 1)
-        energy_part = torch.zeros(
-            len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
-        )
-        energy_part.index_add_(0, data["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data)
-            energy_part.index_add_(0, data["batch"], lr_energy["energy"])
-        
-        if self.heisenberg_tf:
-            energy_part.index_add_(0, data["batch"], lr_energy["energy_spin"])
-
-        if gp_utils.initialized():
-            energy = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy = energy_part
 
         outputs[energy_key] = {"energy": energy} if self.wrap_property else energy
 
@@ -2694,597 +1196,76 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 {"embeddings": embeddings} if self.wrap_property else embeddings
             )
 
-        if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_part.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-            if gp_utils.initialized():
-                grads = (
-                    gp_utils.reduce_from_model_parallel_region(grads[0]),
-                    gp_utils.reduce_from_model_parallel_region(grads[1]),
-                )
+        # Determine if we need create_graph for higher-order derivatives
+        # Hessian computation requires second derivatives, so we need create_graph=True
+        create_graph = self.training or self.regress_config.hessian
 
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
+        if self.regress_config.stress and not self.regress_config.direct_stress:
+            forces, stress = compute_forces_and_stress(
+                energy_part,
+                data["pos"],
+                data["cell"],
+                batch=data["batch_full"],  # use batch_full to work with GP reduction
+                training=create_graph,
+            )
+            # TODO should we assume gradient forces always when stress is requested?
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        
-        elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_part.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            if gp_utils.initialized():
-                forces = gp_utils.reduce_from_model_parallel_region(forces)
+        elif self.regress_config.forces and not self.regress_config.direct_forces:
+            forces = compute_forces(energy_part, data["pos"], training=self.training)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-        # print("outputs: ", outputs)
+        else:
+            forces = None
+
+        if self.regress_config.hessian:
+            if forces is None:
+                raise ValueError(
+                    "Hessian computation requires forces. "
+                    "Please enable regress_forces or regress_stress."
+                )
+            if data["natoms"].numel() != 1:
+                raise ValueError(
+                    f"Hessian computation requires exactly 1 system in batch, "
+                    f"found {data['natoms'].numel()}"
+                )
+
+            hessian = compute_hessian(
+                forces,
+                data["pos"],
+                vmap=self.regress_config.hessian_vmap,
+                training=create_graph,
+            )
+            outputs[hessian_key] = (
+                {"hessian": hessian} if self.wrap_property else hessian
+            )
+
         return outputs
 
 
-@registry.register_model("esen_mlp_energy_head")
-class MLP_Energy_Head(nn.Module, HeadInterface):
-    def __init__(self, backbone: eSCNMDBackbone, reduce: str = "sum") -> None:
-        super().__init__()
-        self.reduce = reduce
+# Deprecate this head in favor of MLP_EFS_Head with a regress_config.forces=False and regress_config.stress=False.
+class MLP_Energy_Head(MLP_EFS_Head):
+    """MLP head for predicting energy."""
 
-        self.sphere_channels = backbone.sphere_channels
-        self.hidden_channels = backbone.hidden_channels
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
-        )
-
-    def forward(
-        self, data_dict: AtomicData, emb: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        ).view(-1, 1, 1)
-
-        energy_part = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
-        )
-
-        energy_part.index_add_(0, data_dict["batch"], node_energy.view(-1))
-        if gp_utils.initialized():
-            energy = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy = energy_part
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
-
-
-@registry.register_model("esen_mlp_energy_head_lr")
-class MLP_Energy_Head_LR(nn.Module, HeadInterface):
     def __init__(
-        self, 
-        backbone: eSCNMDBackboneLR, 
-        reduce: str = "sum"
+        self,
+        backbone: eSCNMDBackbone,
+        reduce: str = "sum",
+        prefix: str | None = None,
+        wrap_property: bool = False,
     ) -> None:
-        super().__init__()
-        self.reduce = reduce
-
-        self.sphere_channels = backbone.sphere_channels
-        self.return_bec = False
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = (
-            backbone.hidden_channels_lr
-        )  # this might not be in the backbone
-        self.heisenberg_tf = backbone.heisenberg_tf
-        self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
-
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
+        super().__init__(backbone, reduce, prefix, wrap_property)
+        assert (
+            backbone.regress_config.forces is False
+            and backbone.regress_config.stress is False
+        ) or (
+            backbone.regress_config.direct_forces is True
+            or backbone.regress_config.direct_stress is True
+        ), (
+            "regress_forces and regress_stress must be False or direct_forces must be True to use an MLP_Energy_Head. "
+            "Use an MLP_EFS_Head if you want to predict gradient forces and stress."
         )
 
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
 
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-            #self.coupling_nn.apply(self._initialize_weights)
-
-    def get_charges(
-        self, 
-        node_features: torch.Tensor,
-        data: AtomicData, 
-    ):
-        results = {}
-        with torch.enable_grad():  # Ensure gradients are enabled even during evaluation
-            charges_raw = self.q_output_lr(node_features)
-            
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1)   
-                results["electroneg"] = electroneg.view(-1)
-
-        if self.lr_comp_size == 1:
-            results["charges"] = charges_raw.view(-1, 1, 1)  * self.lr_output_scaling_factor
-            
-            
-            if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )
-                # renormalize charges
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                # renormalizes via division
-                charges_raw = true_charge_broadcasted * charges_raw / global_charges_broadcasted
-                results["charges"] = charges_raw
-                
-
-                #print("renormalized global_charges: ", global_charges)
-
-        if self.lr_comp_size == 2:
-
-            # sum across components
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-        
-            
-            if self.normalize_charges_tf:
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-                
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise
-                ) # return [N_atoms, 2]
-
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1) 
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1) 
-            
-        
-        return results
-
-    def get_lr_energies(
-        self, 
-        emb: dict[str, torch.Tensor], 
-        data: AtomicData, 
-        return_charges: bool = False
-    ):
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(), 
-            data
-        )
-        
-        if "edge_index_lr" in emb: 
-            edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        #print("cell: ",  data["cell"].shape)
-        #print("pos: ",  data["pos"].shape)
-        #print("batch: ",  data["batch"].shape)
-        #print("batch unique: ",  data["batch"].unique().shape)
-        
-        # check that all members of the batch have a valid cell, shape is (n_molecules, 3, 3), yields (n_molecules,)
-        if data["cell"] is not None:
-            det_cells = torch.linalg.det(data["cell"])
-        
-        if torch.any(det_cells < 1e-6) or data["cell"] is None or self.use_ewald_tf == False:
-            # use direct sums
-            energy_output_lr_dict = potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                sigma=1.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                conv_function_tf=self.conv_function_tf,
-            )
-        else:
-            energy_output_lr_dict = potential_full_ewald_batched(
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                cell=data["cell"],
-                sigma=1.0,
-                dl=2.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                #conv_function_tf=self.conv_function_tf,
-            )
-        
-        results["energy"] = energy_output_lr_dict["potential"]
-
-        if self.equil_charges_tf:
-
-            en_electrostatic = (charge_dict["electroneg"].view(-1) * charge_dict["charges"].view(-1))
-            en_hardness = 0.5 * (charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1)**2)
-            
-            results["energy"] += en_electrostatic + en_hardness
-         
-
-        if self.heisenberg_tf:
-            #if torch.any(det_cells < 1e-6) or data["cell"] is None:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=data["edge_index"],
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-                sigma=1.0,
-            )
-            #else: 
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict["net_partial_spin"]
-
-
-        return results
-
-    def forward(
-        self, 
-        data_dict: AtomicData, 
-        emb: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze()
-        ).view(-1, 1, 1)
-
-        energy = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
-        )
-
-        energy.index_add_(0, data_dict["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data_dict)
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
-
-
-        if self.heisenberg_tf:
-            #print("energy_part: ", energy, " lr_energy_spin: ", lr_energy["energy_spin"].sum())
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy_spin"])
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
-
-
-@registry.register_model("esen_linear_energy_head")
-class Linear_Energy_Head(nn.Module, HeadInterface):
-    def __init__(self, backbone: eSCNMDBackbone, reduce: str = "sum") -> None:
-        super().__init__()
-        self.reduce = reduce
-
-        self.sphere_channels = backbone.sphere_channels
-        self.return_bec = False
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = (
-            backbone.hidden_channels_lr
-        )  # this might not be in the backbone
-        self.heisenberg_tf = backbone.heisenberg_tf
-        self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
-        )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-            #self.coupling_nn.apply(self._initialize_weights)
-
-    def get_charges(
-        self, 
-        node_features: torch.Tensor,
-        data: AtomicData, 
-        epsilon: float = 1e-8
-    ):
-        results = {}
-        with torch.enable_grad():  # Ensure gradients are enabled even during evaluation
-            charges_raw = self.q_output_lr(node_features)
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1, 1, 1)   
-                results["electroneg"] = electroneg.view(-1, 1, 1)
-
-        if self.lr_comp_size == 1:
-            results["charges"] = charges_raw.view(-1, 1, 1)  * self.lr_output_scaling_factor
-            
-            
-            if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1), 
-                    data["batch"], 
-                    dim=0,
-                )
-                # renormalize charges
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                
-                # renormalizes via division
-                charges_raw = true_charge_broadcasted * charges_raw / ( global_charges_broadcasted + epsilon)
-                results["charges"] = charges_raw
-                
-
-                #print("renormalized global_charges: ", global_charges)
-
-        if self.lr_comp_size == 2:
-
-            # sum across components
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            results["charges_raw"] = charges_raw  * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-            
-            global_charges_batchwise = data["charge"]
-            global_spin_batchwise = data["spin"]
-
-
-            charges_renorm = batch_spin_charge_renormalization(
-                charges_raw=results["charges_raw"],
-                batch=data["batch"],
-                s_total=global_spin_batchwise,
-                q_total=global_charges_batchwise
-            ) # return [N_atoms, 2]
-            
-            #print("charges_renorm: ", charges_renorm.shape)
-
-            results["charges_raw"] = charges_renorm
-            results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1) 
-            results["net_partial_spin"] = (
-                charges_renorm[:, 0] - charges_renorm[:, 1]
-            ).view(-1, 1, 1) 
-            
-        
-        return results
-
-    def get_lr_energies(
-        self, 
-        emb: dict[str, torch.Tensor], 
-        data: AtomicData, 
-        return_charges: bool = False
-    ):
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(), 
-            data
-        )
-        
-        if "edge_index_lr" in emb: 
-            edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        #print("cell: ",  data["cell"].shape)
-        #print("pos: ",  data["pos"].shape)
-        #print("batch: ",  data["batch"].shape)
-        #print("batch unique: ",  data["batch"].unique().shape)
-        
-        # check that all members of the batch have a valid cell, shape is (n_molecules, 3, 3), yields (n_molecules,)
-        if data["cell"] is not None:
-            det_cells = torch.linalg.det(data["cell"])
-        
-        if torch.any(det_cells < 1e-6) or data["cell"] is None or self.use_ewald_tf == False:
-            # use direct sums
-            energy_output_lr_dict = potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                sigma=1.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                conv_function_tf=self.conv_function_tf,
-            )
-        else:
-            energy_output_lr_dict = potential_full_ewald_batched(
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                cell=data["cell"],
-                sigma=1.0,
-                dl=2.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                #conv_function_tf=self.conv_function_tf,
-            )
-        
-        results["energy"] = energy_output_lr_dict["potential"]
-
-        if self.equil_charges_tf:
-            en_electrostatic = (charge_dict["electroneg"].view(-1) * charge_dict["charges"].view(-1))
-            en_hardness = 0.5 * (charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1)**2)
-
-            results["energy"] += en_electrostatic + en_hardness
-         
-
-        if self.heisenberg_tf:
-            #if torch.any(det_cells < 1e-6) or data["cell"] is None:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=data["edge_index"],
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-                sigma=1.0,
-            )
-            #else: 
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict["net_partial_spin"]
-
-
-        return results
-
-    def forward(self, data_dict, emb: dict[str, torch.Tensor]):
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze()
-        ).view(-1, 1, 1)
-
-        energy = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
-        )
-
-        energy.index_add_(0, data_dict["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data_dict)
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
-
-
-        if self.heisenberg_tf:
-            #print("energy_part: ", energy, " lr_energy_spin: ", lr_energy["energy_spin"].sum())
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy_spin"])
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
-
-
-@registry.register_model("esen_linear_energy_head")
 class Linear_Energy_Head(nn.Module, HeadInterface):
     def __init__(self, backbone: eSCNMDBackbone, reduce: str = "sum") -> None:
         super().__init__()
@@ -3294,58 +1275,88 @@ class Linear_Energy_Head(nn.Module, HeadInterface):
     def forward(
         self, data_dict: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        ).view(-1, 1, 1)
-
-        energy_part = torch.zeros(
+        energy, _ = compute_energy(
+            emb,
+            self.energy_block,
+            data_dict["batch"],
             len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
+            natoms=data_dict["natoms"],
+            reduce=self.reduce,
         )
-
-        energy_part.index_add_(0, data_dict["batch"], node_energy.view(-1))
-
-        if gp_utils.initialized():
-            energy = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy = energy_part
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
+        return {"energy": energy}
 
 
-@registry.register_model("esen_linear_force_head")
 class Linear_Force_Head(nn.Module, HeadInterface):
     def __init__(self, backbone: eSCNMDBackbone) -> None:
         super().__init__()
         self.linear = SO3_Linear(backbone.sphere_channels, 1, lmax=1)
 
     def forward(self, data_dict: AtomicData, emb: dict[str, torch.Tensor]):
-        forces = self.linear(emb["node_embedding"].narrow(1, 0, 4))
-        forces = forces.narrow(1, 1, 3)
+        # SO3_Linear with lmax=1 requires both L=0 and L=1 as input
+        l0_l1_embedding = get_l_component_range(emb["node_embedding"], l_min=0, l_max=1)
+        forces_output = self.linear(l0_l1_embedding)
+
+        # Extract L=1 (vector) component from the output
+        forces = get_l_component_range(forces_output, l_min=1, l_max=1)
         forces = forces.view(-1, 3).contiguous()
+
         if gp_utils.initialized():
             forces = gp_utils.gather_from_model_parallel_region(
                 forces, data_dict["atomic_numbers_full"].shape[0]
             )
+
         return {"forces": forces}
 
 
-@registry.register_model("esen_mlp_stress_head")
+def compose_tensor(
+    trace: torch.Tensor,
+    l2_symmetric: torch.Tensor,
+) -> torch.Tensor:
+    """Re-compose a tensor from its decomposition
+
+    Args:
+        trace: a tensor with scalar part of the decomposition of r2 tensors in the batch
+        l2_symmetric: tensor with the symmetric/traceless part of decomposition
+
+    Returns:
+        tensor: rank 2 tensor
+    """
+
+    if trace.shape[1] != 1:
+        raise ValueError("batch of traces must be shape (batch size, 1)")
+
+    if l2_symmetric.shape[1] != 5:
+        raise ValueError("batch of l2_symmetric tensors must be shape (batch size, 5)")
+
+    if trace.shape[0] != l2_symmetric.shape[0]:
+        raise ValueError(
+            "Shape missmatch between trace and l2_symmetric parts. The first dimension is the batch dimension"
+        )
+
+    batch_size = trace.shape[0]
+    decomposed_preds = torch.zeros(
+        batch_size, irreps_sum(2), device=trace.device
+    )  # rank 2
+    decomposed_preds[:, : irreps_sum(0)] = trace
+    decomposed_preds[:, irreps_sum(1) : irreps_sum(2)] = l2_symmetric
+
+    r2_tensor = torch.einsum(
+        "ba, cb->ca",
+        cg_change_mat(2, device=trace.device),
+        decomposed_preds,
+    )
+    return r2_tensor
+
+
 class MLP_Stress_Head(nn.Module, HeadInterface):
+    """MLP head for predicting the stress tensor.
+
+    Predicts the isotropic (L=0) and anisotropic (L=2) parts of the stress tensor
+    separately to ensure symmetry, then recomposes back to the full stress tensor.
+    """
+
     def __init__(self, backbone: eSCNMDBackbone, reduce: str = "mean") -> None:
         super().__init__()
-        """
-        predict the isotropic and anisotropic parts of the stress tensor
-        to ensure symmetry and then recompose back to the full stress tensor
-        """
         self.reduce = reduce
         assert reduce in ["sum", "mean"]
         self.sphere_channels = backbone.sphere_channels
@@ -3363,41 +1374,34 @@ class MLP_Stress_Head(nn.Module, HeadInterface):
     def forward(
         self, data_dict: AtomicData, emb: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        node_scalar = self.scalar_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        ).view(-1, 1, 1)
+        num_systems = len(data_dict["natoms"])
+        batch = data_dict["batch"]
 
-        iso_stress = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_scalar.device,
-            dtype=node_scalar.dtype,
-        )
-        iso_stress.index_add_(0, data_dict["batch"], node_scalar.view(-1))
-
-        if gp_utils.initialized():
-            raise NotImplementedError("This code hasn't been tested yet.")
-            # iso_stress = gp_utils.reduce_from_model_parallel_region(iso_stress)
+        # Compute isotropic (L=0) part of stress using MLP on scalar embedding
+        scalar_embedding = get_l_component_range(
+            emb["node_embedding"], l_min=0, l_max=0
+        ).squeeze(1)
+        node_scalar = self.scalar_block(scalar_embedding).view(-1)
+        iso_stress, _ = reduce_node_to_system(node_scalar, batch, num_systems)
 
         if self.reduce == "mean":
-            iso_stress /= data_dict["natoms"]
+            iso_stress = iso_stress / data_dict["natoms"]
 
-        node_l2 = self.l2_linear(emb["node_embedding"].narrow(1, 0, 9))
-        node_l2 = node_l2.narrow(1, 4, 5)
-        node_l2 = node_l2.view(-1, 5).contiguous()
-
-        aniso_stress = torch.zeros(
-            (len(data_dict["natoms"]), 5),
-            device=node_l2.device,
-            dtype=node_l2.dtype,
+        # Compute anisotropic (L=2) part of stress using SO3_Linear
+        l0l1l2_embedding = get_l_component_range(
+            emb["node_embedding"], l_min=0, l_max=2
         )
-        aniso_stress.index_add_(0, data_dict["batch"], node_l2)
-        if gp_utils.initialized():
-            raise NotImplementedError("This code hasn't been tested yet.")
-            # aniso_stress = gp_utils.reduce_from_model_parallel_region(aniso_stress)
+        l2_output = self.l2_linear(l0l1l2_embedding)
+
+        node_l2 = (
+            get_l_component_range(l2_output, l_min=2, l_max=2).view(-1, 5).contiguous()
+        )
+        aniso_stress, _ = reduce_node_to_system(node_l2, batch, num_systems)
 
         if self.reduce == "mean":
-            aniso_stress /= data_dict["natoms"].unsqueeze(1)
+            aniso_stress = aniso_stress / data_dict["natoms"].unsqueeze(1)
 
+        # Recompose the full stress tensor from isotropic and anisotropic parts
         stress = compose_tensor(iso_stress.unsqueeze(1), aniso_stress)
 
         return {"stress": stress}

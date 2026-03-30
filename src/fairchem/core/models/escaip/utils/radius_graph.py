@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-import numpy as np 
-
 if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
 
@@ -90,24 +88,6 @@ def shifted_sine(x: torch.Tensor) -> torch.Tensor:
     )
 
 
-def bump_function(x: torch.Tensor) -> torch.Tensor:
-    """
-    Bump function for the low memory soft knn. Designed such that the behavior
-    matches sigmoid for small x and the step function for large x. Since torch.where
-    propagates gradients, we need to mask the input tensor x.
-    Args:
-        x: the input tensor
-    Returns:
-        y: the bump function value
-    """
-    mask = x.abs() < 4
-    step = torch.where(x < 0, 0.0, 1.0)
-    x = x.div(4.0).masked_fill_(~mask, 0)
-    bump = torch.exp(-2.0 / (x + 1)) / (
-        torch.exp(-2.0 / (x + 1)) + torch.exp(-2.0 / (1 - x))
-    )
-    return torch.where(mask, bump, step)
-
 def soft_rank(
     dist: torch.Tensor,
     scale: float,
@@ -120,8 +100,9 @@ def soft_rank(
     Returns:
         ranks: the soft rankings
     """
-    ranks = torch.sigmoid(((dist[:, :, None] - dist[:, None, :]) / scale)).sum(dim=-1)
+    ranks = torch.sigmoid((dist[:, :, None] - dist[:, None, :]) / scale).sum(dim=-1)
     return ranks
+
 
 def hard_rank(
     dist: torch.Tensor,
@@ -151,7 +132,7 @@ def soft_rank_low_mem(
     calculate the soft rankings for the soft knn. Approximate with low memory by
     truncating the distance matrix to be [0, k + delta]. This is not exact but is a good
     approximation. It is valid when the difference of distance at k+delta and k is
-    larger than 4 * scale.
+    larger than pi * scale.
     Args:
         dist: the pairwise distance tensor
         k: the number of neighbors
@@ -161,7 +142,7 @@ def soft_rank_low_mem(
         ranks: the soft rankings
     """
     sorted_dist, indicies = torch.sort(dist, dim=-1)
-    ranks_T = bump_function(
+    ranks_T = shifted_sine(
         (sorted_dist[:, : k + delta, None] - sorted_dist[:, None, : k + delta]) / scale
     ).sum(dim=-1)
     ranks = torch.full_like(dist, torch.inf)
@@ -186,7 +167,6 @@ def build_radius_graph(
     lse_scale: float = 0.1,
     use_low_mem: bool = False,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -223,9 +203,6 @@ def build_radius_graph(
     disp = src_pos[None, :, :, :] - pos[:, None, None, :]
     dist = safe_norm(disp, dim=-1)
     dist_T = dist.transpose(0, 1).contiguous()
-    # get the pairwise distance between all atoms
-    # pairwise minimum-image distance matrix for this system (N, N)
-    dist_pairwise = dist.min(dim=2).values
     # compute the rankings, depending on the soft or hard knn
     if soft:
         # calculate the rankings in a soft manner
@@ -290,7 +267,6 @@ def build_radius_graph(
         index2_rank,
         disp,
         env,
-        dist_pairwise,
     )
 
 
@@ -309,7 +285,6 @@ def batched_radius_graph(
     cutoff: float,
     device: torch.device,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -340,48 +315,29 @@ def batched_radius_graph(
     # calculate the starting index of each system
     start_idxs = torch.cumsum(natoms, dim=0) - natoms
     # build the biknn radius graph for each system
-    # Build radius graph for each system and collect results
-    results = [
-        build_radius_graph(
-            pos,
-            cell,
-            image_id,
-            cutoff,
-            start_idx,
-            device,
-            knn_k,
-            knn_soft,
-            knn_sigmoid_scale,
-            knn_lse_scale,
-            knn_use_low_mem,
-        )
-        for pos, cell, image_id, start_idx in zip(
-            pos_list, cell_list, image_id_list, start_idxs
-        )
-    ]
-
-    # Unzip the per-system results
-    (
-        index1_list,
-        index2_list,
-        index1_rank_list,
-        index2_rank_list,
-        disp_list,
-        env_list,
-        dist_blocks,
-    ) = zip(*results)
-
-    # Concatenate tensors that share the same size across systems
-    index1 = torch.cat(index1_list)
-    index2 = torch.cat(index2_list)
-    index1_rank = torch.cat(index1_rank_list)
-    index2_rank = torch.cat(index2_rank_list)
-    disp = torch.cat(disp_list)
-    env = torch.cat(env_list)
-
-    # Assemble a block-diagonal pairwise distance matrix (N, N)
-    dist_pairwise = torch.block_diag(*dist_blocks)
-
+    index1, index2, index1_rank, index2_rank, disp, env = map(
+        torch.cat,
+        zip(
+            *[
+                build_radius_graph(
+                    pos,
+                    cell,
+                    image_id,
+                    cutoff,
+                    start_idx,
+                    device,
+                    knn_k,
+                    knn_soft,
+                    knn_sigmoid_scale,
+                    knn_lse_scale,
+                    knn_use_low_mem,
+                )
+                for pos, cell, image_id, start_idx in zip(
+                    pos_list, cell_list, image_id_list, start_idxs
+                )
+            ]
+        ),
+    )
     # if soft knn, pad the tensors with the maximum number of neighbors.
     padsize = knn_pad_size
     # initialize the padded tensors
@@ -408,7 +364,6 @@ def batched_radius_graph(
     dst_index[1, index2, index2_rank] = index1_rank
 
     return (
-        dist_pairwise,
         padded_disp,
         src_env,
         dst_env,
@@ -431,7 +386,6 @@ def biknn_radius_graph(
     use_pbc: bool,
     device: torch.device,
 ) -> tuple[
-    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
