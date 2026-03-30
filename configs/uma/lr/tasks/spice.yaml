@@ -54,4 +54,4 @@
     - cosine_similarity
     - magnitude_error
     - rmse
-
+    - r2

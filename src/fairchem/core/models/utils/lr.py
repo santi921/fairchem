@@ -106,6 +106,15 @@ def potential_full_from_edge_inds(
     # remove diagonal elements 
     pairwise_potential = pairwise_potential * (i != j).float()
     norm_factor = 90.0474
+    
+    #print("shape out molecule lr energy: ", scatter(
+    #    pairwise_potential, i, dim=0, dim_size=q.size(0), reduce="sum"
+    #).shape)
+
+    #print("molecule lr energy: ", scatter(
+    #    pairwise_potential, i, dim=0, dim_size=q.size(0), reduce="sum"
+    #))
+    
     results["potential"] = scatter(
         pairwise_potential, i, dim=0, dim_size=q.size(0), reduce="sum"
     ) * norm_factor
@@ -119,7 +128,7 @@ def potential_full_ewald_batched(
     cell: torch.Tensor,
     dl: float = 2.0,
     sigma: float = 1.0,
-    epsilon: float = 1e-6,
+    epsilon: float = 1e-10,
     twopi: float = 2.0 * np.pi,
     return_bec: bool = False,
     batch: torch.Tensor | None = None,
@@ -140,7 +149,10 @@ def potential_full_ewald_batched(
     Returns:
         potential_dict: dictionary of potential energy for each atom
     """
-    
+    print("pos shape:", pos.shape)
+    print("q shape:", q.shape)
+    print("cell shape:", cell.shape)
+    print("batch shape:", batch.shape if batch is not None else "None")
     device = pos.device
     sigma_sq_half = sigma ** 2 / 2.0
     k_sq_max = (twopi / dl) ** 2
@@ -149,7 +161,7 @@ def potential_full_ewald_batched(
     if batch is None:
         batch = torch.zeros(pos.shape[0], dtype=torch.int64, device=device)
     
-    # Compute reciprocal lattice vectors for each batch
+    # --- 1. Reciprocal lattice G_b = 2π (M_b^{-1})^T ---
     cell_inv = torch.linalg.inv(cell)  # [B, 3, 3]
     G = 2 * torch.pi * cell_inv.transpose(-2, -1)  # [B, 3, 3]
 
@@ -250,8 +262,10 @@ def potential_full_ewald_batched(
         k_dot_r = torch.mm(pos_b, kvec_final.T)
         
         # Compute S_k components without creating intermediate tensors
-        cos_k_dot_r = torch.cos(k_dot_r)
-        sin_k_dot_r = torch.sin(k_dot_r)
+        cos_k_dot_r = torch.cos(k_dot_r) # [N, 1, K]
+        sin_k_dot_r = torch.sin(k_dot_r) # [N, 1, K]
+        print("shape cos_k_dot_r: ", cos_k_dot_r.shape)
+        print("shape sin_k_dot_r: ", sin_k_dot_r.shape) 
         
         # Multiply q_b in-place and sum
         cos_k_dot_r *= q_b#.unsqueeze(1)
@@ -268,17 +282,18 @@ def potential_full_ewald_batched(
         # Compute potential for this batch
         volume = torch.det(cell[b_idx])
         
-        # Combine factors, kfac, and S_k_sq efficiently
+        # Combine factors, kfac, and S_k_sq efficiently, rm self-interaction
         factors *= kfac
         factors *= S_k_sq
-        pot_b = torch.sum(factors) / volume
-        
-        # Remove self-interaction
-        pot_b -= torch.sum(q_b**2) / (sigma * (2 * torch.pi)**1.5)
+        pot_b = factors / volume - q_b**2 / (sigma * (twopi)**1.5)
+        print("shape out molecule lr energy ewald batch: ", pot_b.shape)
         
         # Assign to result
         result_potentials[atom_mask] = pot_b * norm_factor
     
+    print("shape out molecule lr energy ewald: ", result_potentials.shape)
+    print("molecule lr energy ewald: ", result_potentials)
+
     results = {"potential": result_potentials}
     return results
 
