@@ -41,12 +41,7 @@ from fairchem.core.models.uma.nn.layer_norm import (
 from fairchem.core.models.uma.nn.mole_utils import MOLEInterface
 from fairchem.core.models.uma.nn.radial import GaussianSmearing, PolynomialEnvelope
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
-from fairchem.core.models.utils.lr import (
-    batch_spin_charge_renormalization,
-    heisenberg_potential_full_from_edge_inds,
-    potential_full_ewald_batched,
-    potential_full_from_edge_inds,
-)
+from fairchem.core.models.utils.lr_charges import LRChargePredictor
 
 from .escn_md import (
     ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE,
@@ -586,56 +581,72 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         return set(no_wd_list)
 
 
-class _LRNormHelper(nn.Module):
+def _build_lr_predictor(backbone: eSCNMDBackboneLR) -> LRChargePredictor:
     """
-    Additive charge normalization for single-channel charges.
-
-    Distributes the residual (target_total - predicted_total) uniformly
-    across atoms in each batch. This avoids the division-by-zero issue
-    of multiplicative normalization when predicted charges sum to ~0.
+    Build an LRChargePredictor from backbone config.
     """
+    lr_comp_size = 2 if backbone.heisenberg_tf else 1
+    return LRChargePredictor(
+        sphere_channels=backbone.sphere_channels,
+        hidden_channels_lr=backbone.hidden_channels_lr,
+        lr_comp_size=lr_comp_size,
+        lr_output_scaling_factor=backbone.lr_output_scaling_factor,
+        normalize_charges_tf=backbone.normalize_charges_tf,
+        equil_charges_tf=backbone.equil_charges_tf,
+        heisenberg_tf=backbone.heisenberg_tf,
+        use_ewald_tf=backbone.use_ewald_tf,
+        conv_function_tf=backbone.conv_function_tf,
+        return_bec=backbone.return_bec,
+    )
 
-    @staticmethod
-    def normalize_single_channel(
-        charges_raw: torch.Tensor,
-        batch: torch.Tensor,
-        charge_targets: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Normalize charges via additive shift.
 
-        Args:
-            charges_raw: Raw predicted charges [n_atoms, 1] or [n_atoms]
-            batch: Batch indices [n_atoms]
-            charge_targets: Per-batch target charges [n_batches] or [n_batches, 1]
-        """
-        flat = charges_raw.view(-1)
-        num_batches = batch.max() + 1
+def _build_energy_block(sphere_channels: int, hidden_channels: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(sphere_channels, hidden_channels, bias=True),
+        nn.SiLU(),
+        nn.Linear(hidden_channels, hidden_channels, bias=True),
+        nn.SiLU(),
+        nn.Linear(hidden_channels, 1, bias=True),
+    )
 
-        # Predicted total per batch
-        predicted_total = torch.zeros(num_batches, device=flat.device, dtype=flat.dtype)
-        predicted_total.scatter_add_(0, batch, flat)
 
-        # Count atoms per batch
-        ones = torch.ones_like(flat)
-        natoms_per_batch = torch.zeros(
-            num_batches, device=flat.device, dtype=flat.dtype
-        )
-        natoms_per_batch.scatter_add_(0, batch, ones)
+def _compute_energy_with_lr(
+    energy_block: nn.Module,
+    lr_predictor: LRChargePredictor | None,
+    emb: dict[str, torch.Tensor],
+    data: AtomicData,
+    latent_charge_tf: bool,
+    heisenberg_tf: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Compute short-range + long-range energy. Returns (energy_per_system, lr_dict).
+    """
+    node_energy = energy_block(emb["node_embedding"].narrow(1, 0, 1).squeeze()).view(-1)
 
-        # Target total per batch (broadcast to per-atom)
-        target_total = charge_targets.view(-1)[:num_batches]
+    energy = torch.zeros(
+        len(data["natoms"]),
+        device=node_energy.device,
+        dtype=node_energy.dtype,
+    )
+    energy.index_add_(0, data["batch"], node_energy)
 
-        # Additive shift: distribute residual uniformly
-        residual = target_total - predicted_total
-        shift_per_atom = residual / natoms_per_batch
-        corrected = flat + shift_per_atom[batch]
+    lr_energy_dict = None
+    if latent_charge_tf and lr_predictor is not None:
+        lr_energy_dict = lr_predictor.get_lr_energies(emb, data)
+        energy.index_add_(0, data["batch"], lr_energy_dict["energy"])
 
-        return corrected.view_as(charges_raw)
+    if heisenberg_tf and lr_energy_dict is not None:
+        energy.index_add_(0, data["batch"], lr_energy_dict["energy_spin"])
+
+    return energy, lr_energy_dict
 
 
 @registry.register_model("esen_efs_head_lr")
 class MLP_EFS_Head_LR(nn.Module, HeadInterface):
+    """
+    Gradient-based energy/force/stress head with long-range electrostatics.
+    """
+
     def __init__(
         self,
         backbone: eSCNMDBackboneLR,
@@ -649,208 +660,20 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         self.regress_forces = backbone.regress_forces
         self.prefix = prefix
         self.wrap_property = wrap_property
-        self.return_bec = backbone.return_bec
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-
-        self.sphere_channels = backbone.sphere_channels
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = backbone.hidden_channels_lr
-        self.heisenberg_tf = backbone.heisenberg_tf
         self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
+        self.heisenberg_tf = backbone.heisenberg_tf
 
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
+        self.energy_block = _build_energy_block(
+            backbone.sphere_channels, backbone.hidden_channels
         )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-
-        self.lr_predictor = _LRNormHelper()
+        self.lr_predictor = (
+            _build_lr_predictor(backbone) if self.latent_charge_tf else None
+        )
 
         backbone.direct_forces = False
         assert (
             not backbone.direct_forces
         ), "EFS head is only used for gradient-based forces/stress."
-
-    def get_charges(
-        self,
-        node_features: torch.Tensor,
-        data: AtomicData,
-        epsilon: float = 1e-8,
-    ):
-        results = {}
-        with torch.enable_grad():
-            charges_raw = self.q_output_lr(node_features)
-
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1)
-                results["electroneg"] = electroneg.view(-1)
-
-        if self.lr_comp_size == 1:
-            results["charges"] = (
-                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-
-            if self.normalize_charges_tf:
-                charges_raw = self.lr_predictor.normalize_single_channel(
-                    charges_raw,
-                    data["batch"],
-                    data["charge"],
-                )
-                results["charges"] = charges_raw
-
-        if self.lr_comp_size == 2:
-            results["charges"] = (
-                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-            results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-
-            if self.normalize_charges_tf:
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise,
-                )
-
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1)
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1)
-
-        return results
-
-    def get_lr_energies(
-        self,
-        emb: dict[str, torch.Tensor],
-        data: AtomicData,
-        return_charges: bool = False,
-    ):
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(),
-            data,
-        )
-
-        if "edge_index_lr" in emb:
-            edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        # Determine whether to use direct sum or Ewald
-        use_direct_sum = True
-        if data["cell"] is not None and self.use_ewald_tf:
-            det_cells = torch.linalg.det(data["cell"])
-            if not torch.any(det_cells < 1e-6):
-                use_direct_sum = False
-
-        if use_direct_sum:
-            energy_output_lr_dict = potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                sigma=1.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                conv_function_tf=self.conv_function_tf,
-            )
-        else:
-            energy_output_lr_dict = potential_full_ewald_batched(
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                cell=data["cell"],
-                sigma=1.0,
-                dl=2.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-            )
-
-        results["energy"] = energy_output_lr_dict["potential"]
-
-        if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
-                "charges"
-            ].view(-1)
-            en_hardness = 0.5 * (
-                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
-            )
-            results["energy"] += en_electrostatic + en_hardness
-
-        if self.heisenberg_tf:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-            )
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict.get("net_partial_spin")
-
-        return results
 
     @conditional_grad(torch.enable_grad())
     def forward(
@@ -866,20 +689,14 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             stress_key = "stress"
 
         outputs = {}
-        _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        _output = self.energy_block(_input)
-        node_energy = _output.view(-1, 1, 1)
-        energy_part = torch.zeros(
-            len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
+        energy_part, _ = _compute_energy_with_lr(
+            self.energy_block,
+            self.lr_predictor,
+            emb,
+            data,
+            self.latent_charge_tf,
+            self.heisenberg_tf,
         )
-        energy_part.index_add_(0, data["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data)
-            energy_part.index_add_(0, data["batch"], lr_energy["energy"])
-
-        if self.heisenberg_tf:
-            energy_part.index_add_(0, data["batch"], lr_energy["energy_spin"])
 
         if gp_utils.initialized():
             energy = gp_utils.reduce_from_model_parallel_region(energy_part)
@@ -910,7 +727,6 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
             virial = grads[1].view(-1, 3, 3)
             volume = torch.det(data["cell"]).abs().unsqueeze(-1)
             stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
             stress = stress.view(-1, 9)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
@@ -931,6 +747,10 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
 
 @registry.register_model("esen_mlp_energy_head_lr")
 class MLP_Energy_Head_LR(nn.Module, HeadInterface):
+    """
+    Energy-only head with long-range electrostatics.
+    """
+
     def __init__(
         self,
         backbone: eSCNMDBackboneLR,
@@ -938,463 +758,64 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
     ) -> None:
         super().__init__()
         self.reduce = reduce
-
-        self.sphere_channels = backbone.sphere_channels
-        self.return_bec = False
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = backbone.hidden_channels_lr
-        self.heisenberg_tf = backbone.heisenberg_tf
         self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
+        self.heisenberg_tf = backbone.heisenberg_tf
 
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
+        self.energy_block = _build_energy_block(
+            backbone.sphere_channels, backbone.hidden_channels
         )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-
-        self.lr_predictor = _LRNormHelper()
-
-    def get_charges(
-        self,
-        node_features: torch.Tensor,
-        data: AtomicData,
-        epsilon: float = 1e-8,
-    ):
-        results = {}
-        with torch.enable_grad():
-            charges_raw = self.q_output_lr(node_features)
-
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1)
-                results["electroneg"] = electroneg.view(-1)
-
-        if self.lr_comp_size == 1:
-            results["charges"] = (
-                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-
-            if self.normalize_charges_tf:
-                charges_raw = self.lr_predictor.normalize_single_channel(
-                    charges_raw,
-                    data["batch"],
-                    data["charge"],
-                )
-                results["charges"] = charges_raw
-
-        if self.lr_comp_size == 2:
-            results["charges"] = (
-                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-            results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-
-            if self.normalize_charges_tf:
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise,
-                )
-
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1)
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1)
-
-        return results
-
-    def get_lr_energies(
-        self,
-        emb: dict[str, torch.Tensor],
-        data: AtomicData,
-        return_charges: bool = False,
-    ):
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(),
-            data,
+        self.lr_predictor = (
+            _build_lr_predictor(backbone) if self.latent_charge_tf else None
         )
-
-        if "edge_index_lr" in emb:
-            edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        use_direct_sum = True
-        if data["cell"] is not None and self.use_ewald_tf:
-            det_cells = torch.linalg.det(data["cell"])
-            if not torch.any(det_cells < 1e-6):
-                use_direct_sum = False
-
-        if use_direct_sum:
-            energy_output_lr_dict = potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                sigma=1.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                conv_function_tf=self.conv_function_tf,
-            )
-        else:
-            energy_output_lr_dict = potential_full_ewald_batched(
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                cell=data["cell"],
-                sigma=1.0,
-                dl=2.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-            )
-
-        results["energy"] = energy_output_lr_dict["potential"]
-
-        if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
-                "charges"
-            ].view(-1)
-            en_hardness = 0.5 * (
-                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
-            )
-            results["energy"] += en_electrostatic + en_hardness
-
-        if self.heisenberg_tf:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-            )
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict.get("net_partial_spin")
-
-        return results
 
     def forward(
         self,
         data_dict: AtomicData,
         emb: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze()
-        ).view(-1, 1, 1)
-
-        energy = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
+        energy, _ = _compute_energy_with_lr(
+            self.energy_block,
+            self.lr_predictor,
+            emb,
+            data_dict,
+            self.latent_charge_tf,
+            self.heisenberg_tf,
         )
 
-        energy.index_add_(0, data_dict["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data_dict)
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
-
-        if self.heisenberg_tf:
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy_spin"])
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
+        if self.reduce == "mean":
+            energy = energy / data_dict["natoms"]
+        return {"energy": energy}
 
 
 @registry.register_model("esen_linear_energy_head_lr")
 class Linear_Energy_Head_LR(nn.Module, HeadInterface):
+    """
+    Energy-only head with linear energy block and long-range electrostatics.
+    """
+
     def __init__(self, backbone: eSCNMDBackboneLR, reduce: str = "sum") -> None:
         super().__init__()
         self.reduce = reduce
-
-        self.sphere_channels = backbone.sphere_channels
-        self.return_bec = False
-        self.conv_function_tf = backbone.conv_function_tf
-        self.lr_output_scaling_factor = backbone.lr_output_scaling_factor
-        self.hidden_channels = backbone.hidden_channels
-        self.hidden_channels_lr = backbone.hidden_channels_lr
-        self.heisenberg_tf = backbone.heisenberg_tf
         self.latent_charge_tf = backbone.latent_charge_tf
-        self.normalize_charges_tf = backbone.normalize_charges_tf
-        self.equil_charges_tf = backbone.equil_charges_tf
-        self.use_ewald_tf = backbone.use_ewald_tf
+        self.heisenberg_tf = backbone.heisenberg_tf
 
-        self.lr_comp_size = 1
-        if self.heisenberg_tf:
-            self.lr_comp_size = 2
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
+        self.energy_block = _build_energy_block(
+            backbone.sphere_channels, backbone.hidden_channels
         )
-
-        if self.latent_charge_tf:
-            self.q_output_lr = nn.Sequential(
-                nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.lr_comp_size, bias=True),
-            )
-
-            if self.equil_charges_tf:
-                self.hardness_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-                self.electroneg_output_lr = nn.Sequential(
-                    nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
-                    nn.SiLU(),
-                    nn.Linear(
-                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
-                    ),
-                    nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, 1, bias=True),
-                )
-
-        if self.heisenberg_tf:
-            self.coupling_nn = nn.Sequential(
-                nn.Linear(1, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels_lr, 1, bias=True),
-            )
-
-        self.lr_predictor = _LRNormHelper()
-
-    def get_charges(
-        self,
-        node_features: torch.Tensor,
-        data: AtomicData,
-        epsilon: float = 1e-8,
-    ):
-        results = {}
-        with torch.enable_grad():
-            charges_raw = self.q_output_lr(node_features)
-            if self.equil_charges_tf:
-                hardness = self.hardness_output_lr(node_features)
-                electroneg = self.electroneg_output_lr(node_features)
-                results["hardness"] = hardness.view(-1)
-                results["electroneg"] = electroneg.view(-1)
-
-        if self.lr_comp_size == 1:
-            results["charges"] = (
-                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-
-            if self.normalize_charges_tf:
-                charges_raw = self.lr_predictor.normalize_single_channel(
-                    charges_raw,
-                    data["batch"],
-                    data["charge"],
-                )
-                results["charges"] = charges_raw
-
-        if self.lr_comp_size == 2:
-            results["charges"] = (
-                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-            results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
-            alpha = results["charges_raw"][:, 0]
-            beta = results["charges_raw"][:, 1]
-            spin = alpha - beta
-            results["net_partial_spin"] = spin.view(-1, 1, 1)
-
-            if self.normalize_charges_tf:
-                global_charges_batchwise = data["charge"]
-                global_spin_batchwise = data["spin"]
-
-                charges_renorm = batch_spin_charge_renormalization(
-                    charges_raw=results["charges_raw"],
-                    batch=data["batch"],
-                    s_total=global_spin_batchwise,
-                    q_total=global_charges_batchwise,
-                )
-
-                results["charges_raw"] = charges_renorm
-                results["charges"] = charges_renorm.sum(dim=1).view(-1, 1, 1)
-                results["net_partial_spin"] = (
-                    charges_renorm[:, 0] - charges_renorm[:, 1]
-                ).view(-1, 1, 1)
-
-        return results
-
-    def get_lr_energies(
-        self,
-        emb: dict[str, torch.Tensor],
-        data: AtomicData,
-        return_charges: bool = False,
-    ):
-        results = {}
-
-        charge_dict = self.get_charges(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze(),
-            data,
+        self.lr_predictor = (
+            _build_lr_predictor(backbone) if self.latent_charge_tf else None
         )
-
-        if "edge_index_lr" in emb:
-            edges_lr = emb["edge_index_lr"]
-        else:
-            edges_lr = emb["edge_index"]
-
-        use_direct_sum = True
-        if data["cell"] is not None and self.use_ewald_tf:
-            det_cells = torch.linalg.det(data["cell"])
-            if not torch.any(det_cells < 1e-6):
-                use_direct_sum = False
-
-        if use_direct_sum:
-            energy_output_lr_dict = potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                sigma=1.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-                conv_function_tf=self.conv_function_tf,
-            )
-        else:
-            energy_output_lr_dict = potential_full_ewald_batched(
-                pos=data["pos"],
-                q=charge_dict["charges"],
-                cell=data["cell"],
-                sigma=1.0,
-                dl=2.0,
-                epsilon=1e-6,
-                return_bec=self.return_bec,
-                batch=data["batch"],
-            )
-
-        results["energy"] = energy_output_lr_dict["potential"]
-
-        if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
-                "charges"
-            ].view(-1)
-            en_hardness = 0.5 * (
-                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
-            )
-            results["energy"] += en_electrostatic + en_hardness
-
-        if self.heisenberg_tf:
-            energy_spin = heisenberg_potential_full_from_edge_inds(
-                edge_index=edges_lr,
-                q=charge_dict["charges_raw"],
-                pos=data["pos"],
-                nn=self.coupling_nn,
-            )
-            results["energy_spin"] = energy_spin
-
-        if return_charges:
-            results["charges"] = charge_dict["charges"]
-            if self.lr_comp_size == 2:
-                results["spin"] = charge_dict.get("net_partial_spin")
-
-        return results
 
     def forward(self, data_dict, emb: dict[str, torch.Tensor]):
-        node_energy = self.energy_block(
-            emb["node_embedding"].narrow(1, 0, 1).squeeze()
-        ).view(-1, 1, 1)
-
-        energy = torch.zeros(
-            len(data_dict["natoms"]),
-            device=node_energy.device,
-            dtype=node_energy.dtype,
+        energy, _ = _compute_energy_with_lr(
+            self.energy_block,
+            self.lr_predictor,
+            emb,
+            data_dict,
+            self.latent_charge_tf,
+            self.heisenberg_tf,
         )
 
-        energy.index_add_(0, data_dict["batch"], node_energy.view(-1))
-
-        if self.latent_charge_tf:
-            lr_energy = self.get_lr_energies(emb, data_dict)
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy"])
-
-        if self.heisenberg_tf:
-            energy.index_add_(0, data_dict["batch"], lr_energy["energy_spin"])
-
-        if self.reduce == "sum":
-            return {"energy": energy}
-        elif self.reduce == "mean":
-            return {"energy": energy / data_dict["natoms"]}
-        else:
-            raise ValueError(
-                f"reduce can only be sum or mean, user provided: {self.reduce}"
-            )
+        if self.reduce == "mean":
+            energy = energy / data_dict["natoms"]
+        return {"energy": energy}
