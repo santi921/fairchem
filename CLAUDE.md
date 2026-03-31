@@ -19,6 +19,16 @@ pre-commit run --files path/to/modified_file.py
 fairchem -c config.yaml [overrides...]
 ```
 
+## Shared Skills
+
+For available skills and tool guidance, read the relevant files in `/home/santiagovargas/dev/claude-skills/` as needed:
+- **Scientific** (PyG, PyTorch Lightning, RDKit, pymatgen, matplotlib, scikit-learn): `scientific/`
+- **Code review & planning** (multi-agent reviews, brainstorm/plan/work workflows): `compound/`
+- **Document processing** (PDF, XLSX): `documents/`
+
+Read the specific skill file when you need detailed API patterns or usage guidance for a task.
+
+
 ## Code Style
 
 **IMPORTANT: You MUST run `pre-commit run --files /path/to/modified_file.py` on every file you modify, before considering the task complete. No exceptions.**

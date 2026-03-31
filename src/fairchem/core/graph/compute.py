@@ -223,8 +223,8 @@ def generate_graph(
             )
         )
 
-        # atom indexs in the edge_index need to be offset
-        #atom_index_offset = data.natoms.cumsum(dim=0).roll(1)
+        # atom indices in the edge_index need to be offset
+        atom_index_offset = data.natoms.cumsum(dim=0).roll(1)
         atom_index_offset[0] = 0
         edge_index_lr = torch.hstack(
             [
@@ -245,5 +245,5 @@ def generate_graph(
             return_distance_vec=True,
         )
         ret_dict["edge_index_lr"] = out_lr["edge_index"]
-    #print("data dict keys: ", ret_dict.keys())
+    # print("data dict keys: ", ret_dict.keys())
     return ret_dict
