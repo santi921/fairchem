@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Literal
 import torch
 import torch.nn as nn
 from torch.profiler import record_function
-from torch_scatter import scatter_add
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.registry import registry
@@ -31,6 +30,7 @@ from fairchem.core.models.uma.nn.embedding import (
     DatasetEmbedding,
     EdgeDegreeEmbedding,
 )
+from fairchem.core.models.uma.nn.execution_backends import get_execution_backend
 from fairchem.core.models.uma.nn.layer_norm import (
     EquivariantLayerNormArray,
     EquivariantLayerNormArraySphericalHarmonics,
@@ -41,7 +41,6 @@ from fairchem.core.models.uma.nn.layer_norm import (
 from fairchem.core.models.uma.nn.mole_utils import MOLEInterface
 from fairchem.core.models.uma.nn.radial import GaussianSmearing, PolynomialEnvelope
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
-from fairchem.core.models.utils.irreps import cg_change_mat, irreps_sum
 from fairchem.core.models.utils.lr import (
     batch_spin_charge_renormalization,
     heisenberg_potential_full_from_edge_inds,
@@ -49,7 +48,10 @@ from fairchem.core.models.utils.lr import (
     potential_full_from_edge_inds,
 )
 
-from .escn_md import ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE
+from .escn_md import (
+    ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE,
+    resolve_dataset_mapping,
+)
 from .escn_md_block import eSCNMD_Block
 
 if TYPE_CHECKING:
@@ -111,6 +113,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         self.grid_resolution = grid_resolution
         self.num_sphere_samples = num_sphere_samples
         self.always_use_pbc = always_use_pbc
+        self.backend = get_execution_backend("general")
 
         # energy conservation related
         self.regress_forces = regress_forces
@@ -135,9 +138,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         self.dataset_list = dataset_list
         self.use_dataset_embedding = use_dataset_embedding
         if self.use_dataset_embedding:
-            assert (
-                self.dataset_list
-            ), "the dataset list is empty, please add it to the model backbone config"
+            self.dataset_mapping = resolve_dataset_mapping(
+                self.dataset_list, None, "dataset_list"
+            )
 
         # rotation utils
         Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "Jd.pt"))
@@ -174,8 +177,8 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         if self.use_dataset_embedding:
             self.dataset_embedding = DatasetEmbedding(
                 self.sphere_channels,
-                grad=self.dataset_emb_grad,
-                dataset_list=self.dataset_list,
+                enable_grad=self.dataset_emb_grad,
+                dataset_mapping=self.dataset_mapping,
             )
             self.mix_csd = nn.Linear(3 * self.sphere_channels, self.sphere_channels)
         else:
@@ -215,6 +218,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             rescale_factor=5.0,
             mappingReduced=self.mappingReduced,
             activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+            backend=self.backend,
         )
 
         self.envelope = PolynomialEnvelope(exponent=5)
@@ -256,6 +260,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                 self.act_type,
                 self.ff_type,
                 activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+                backend=self.backend,
             )
             self.blocks.append(block)
 
@@ -357,13 +362,13 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             if self.always_use_pbc:
                 pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
             else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
+                assert (
+                    "pbc" in data_dict
+                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
                 pbc = data_dict["pbc"]
-            assert pbc.all() or (~pbc).all(), (
-                "We can only accept pbc that is all true or all false"
-            )
+            assert (
+                pbc.all() or (~pbc).all()
+            ), "We can only accept pbc that is all true or all false"
             logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
 
             graph_dict = generate_graph(
@@ -376,9 +381,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                 cutoff_lr=self.cutoff_lr,
             )
         else:
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
+            assert (
+                "edge_index" in data_dict
+            ), "otf_graph is false, need to provide edge_index as input!"
             cell_per_edge = data_dict["cell"].repeat_interleave(
                 data_dict["nedges"], dim=0
             )
@@ -392,9 +397,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                 - data_dict["pos"][data_dict["edge_index"][1]]
                 + shifts
             )
-            edge_distance = torch.linalg.norm(
-                edge_distance_vec, dim=-1, keepdim=False
-            )
+            edge_distance = torch.linalg.norm(edge_distance_vec, dim=-1, keepdim=False)
 
             graph_dict = {
                 "edge_index": data_dict["edge_index"],
@@ -487,12 +490,13 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             x_edge = torch.cat(
                 (edge_distance_embedding, source_embedding, target_embedding), dim=1
             )
+            # Pre-fuse envelope into wigner_inv
+            wigner_inv_envelope = wigner_and_M_mapping_inv * edge_envelope
             x_message = self.edge_degree_embedding(
                 x_message,
                 x_edge,
                 graph_dict["edge_index"],
-                wigner_and_M_mapping_inv,
-                edge_envelope,
+                wigner_inv_envelope,
                 graph_dict["node_offset"],
             )
 
@@ -501,11 +505,9 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                 x_message = self.blocks[i](
                     x_message,
                     x_edge,
-                    graph_dict["edge_distance"],
                     graph_dict["edge_index"],
                     wigner_and_M_mapping,
-                    wigner_and_M_mapping_inv,
-                    edge_envelope,
+                    wigner_inv_envelope,
                     total_atoms_across_gp_ranks=data_dict["atomic_numbers_full"].shape[
                         0
                     ],
@@ -533,9 +535,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             torch.arange(len(atomic_numbers_full)).to(atomic_numbers_full.device),
             gp_utils.get_gp_world_size(),
         )[gp_utils.get_gp_rank()]
-        assert (
-            node_partition.numel() > 0
-        ), "No atoms in this graph parallel partition."
+        assert node_partition.numel() > 0, "No atoms in this graph parallel partition."
 
         edge_partition = torch.where(
             torch.logical_and(
@@ -584,6 +584,54 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                     no_wd_list.append(global_parameter_name)
 
         return set(no_wd_list)
+
+
+class _LRNormHelper(nn.Module):
+    """
+    Additive charge normalization for single-channel charges.
+
+    Distributes the residual (target_total - predicted_total) uniformly
+    across atoms in each batch. This avoids the division-by-zero issue
+    of multiplicative normalization when predicted charges sum to ~0.
+    """
+
+    @staticmethod
+    def normalize_single_channel(
+        charges_raw: torch.Tensor,
+        batch: torch.Tensor,
+        charge_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Normalize charges via additive shift.
+
+        Args:
+            charges_raw: Raw predicted charges [n_atoms, 1] or [n_atoms]
+            batch: Batch indices [n_atoms]
+            charge_targets: Per-batch target charges [n_batches] or [n_batches, 1]
+        """
+        flat = charges_raw.view(-1)
+        num_batches = batch.max() + 1
+
+        # Predicted total per batch
+        predicted_total = torch.zeros(num_batches, device=flat.device, dtype=flat.dtype)
+        predicted_total.scatter_add_(0, batch, flat)
+
+        # Count atoms per batch
+        ones = torch.ones_like(flat)
+        natoms_per_batch = torch.zeros(
+            num_batches, device=flat.device, dtype=flat.dtype
+        )
+        natoms_per_batch.scatter_add_(0, batch, ones)
+
+        # Target total per batch (broadcast to per-atom)
+        target_total = charge_targets.view(-1)[:num_batches]
+
+        # Additive shift: distribute residual uniformly
+        residual = target_total - predicted_total
+        shift_per_atom = residual / natoms_per_batch
+        corrected = flat + shift_per_atom[batch]
+
+        return corrected.view_as(charges_raw)
 
 
 @registry.register_model("esen_efs_head_lr")
@@ -639,14 +687,18 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 self.hardness_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
                 self.electroneg_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
@@ -660,10 +712,12 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 nn.Linear(self.hidden_channels_lr, 1, bias=True),
             )
 
+        self.lr_predictor = _LRNormHelper()
+
         backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
+        assert (
+            not backbone.direct_forces
+        ), "EFS head is only used for gradient-based forces/stress."
 
     def get_charges(
         self,
@@ -682,21 +736,22 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
                 results["electroneg"] = electroneg.view(-1)
 
         if self.lr_comp_size == 1:
-            results["charges"] = charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
 
             if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1),
+                charges_raw = self.lr_predictor.normalize_single_channel(
+                    charges_raw,
                     data["batch"],
-                    dim=0,
+                    data["charge"],
                 )
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                charges_raw = true_charge_broadcasted * charges_raw / (global_charges_broadcasted + epsilon)
                 results["charges"] = charges_raw
 
         if self.lr_comp_size == 2:
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
             results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
             alpha = results["charges_raw"][:, 0]
             beta = results["charges_raw"][:, 1]
@@ -773,8 +828,12 @@ class MLP_EFS_Head_LR(nn.Module, HeadInterface):
         results["energy"] = energy_output_lr_dict["potential"]
 
         if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict["charges"].view(-1)
-            en_hardness = 0.5 * (charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2)
+            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
+                "charges"
+            ].view(-1)
+            en_hardness = 0.5 * (
+                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
+            )
             results["energy"] += en_electrostatic + en_hardness
 
         if self.heisenberg_tf:
@@ -917,14 +976,18 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
                 self.hardness_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
                 self.electroneg_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
@@ -937,6 +1000,8 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
                 nn.SiLU(),
                 nn.Linear(self.hidden_channels_lr, 1, bias=True),
             )
+
+        self.lr_predictor = _LRNormHelper()
 
     def get_charges(
         self,
@@ -955,21 +1020,22 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
                 results["electroneg"] = electroneg.view(-1)
 
         if self.lr_comp_size == 1:
-            results["charges"] = charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
 
             if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1),
+                charges_raw = self.lr_predictor.normalize_single_channel(
+                    charges_raw,
                     data["batch"],
-                    dim=0,
+                    data["charge"],
                 )
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                charges_raw = true_charge_broadcasted * charges_raw / (global_charges_broadcasted + epsilon)
                 results["charges"] = charges_raw
 
         if self.lr_comp_size == 2:
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
             results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
             alpha = results["charges_raw"][:, 0]
             beta = results["charges_raw"][:, 1]
@@ -1045,8 +1111,12 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
         results["energy"] = energy_output_lr_dict["potential"]
 
         if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict["charges"].view(-1)
-            en_hardness = 0.5 * (charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2)
+            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
+                "charges"
+            ].view(-1)
+            en_hardness = 0.5 * (
+                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
+            )
             results["energy"] += en_electrostatic + en_hardness
 
         if self.heisenberg_tf:
@@ -1142,14 +1212,18 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
                 self.hardness_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
                 self.electroneg_output_lr = nn.Sequential(
                     nn.Linear(self.sphere_channels, self.hidden_channels_lr, bias=True),
                     nn.SiLU(),
-                    nn.Linear(self.hidden_channels_lr, self.hidden_channels_lr, bias=True),
+                    nn.Linear(
+                        self.hidden_channels_lr, self.hidden_channels_lr, bias=True
+                    ),
                     nn.SiLU(),
                     nn.Linear(self.hidden_channels_lr, 1, bias=True),
                 )
@@ -1162,6 +1236,8 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
                 nn.SiLU(),
                 nn.Linear(self.hidden_channels_lr, 1, bias=True),
             )
+
+        self.lr_predictor = _LRNormHelper()
 
     def get_charges(
         self,
@@ -1179,21 +1255,22 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
                 results["electroneg"] = electroneg.view(-1)
 
         if self.lr_comp_size == 1:
-            results["charges"] = charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
 
             if self.normalize_charges_tf:
-                global_charges = scatter_add(
-                    charges_raw.view(-1, 1),
+                charges_raw = self.lr_predictor.normalize_single_channel(
+                    charges_raw,
                     data["batch"],
-                    dim=0,
+                    data["charge"],
                 )
-                global_charges_broadcasted = global_charges[data["batch"]]
-                true_charge_broadcasted = data["charge"][data["batch"]].view(-1, 1)
-                charges_raw = true_charge_broadcasted * charges_raw / (global_charges_broadcasted + epsilon)
                 results["charges"] = charges_raw
 
         if self.lr_comp_size == 2:
-            results["charges"] = charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            results["charges"] = (
+                charges_raw.sum(dim=1).view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
             results["charges_raw"] = charges_raw * self.lr_output_scaling_factor
             alpha = results["charges_raw"][:, 0]
             beta = results["charges_raw"][:, 1]
@@ -1269,8 +1346,12 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
         results["energy"] = energy_output_lr_dict["potential"]
 
         if self.equil_charges_tf:
-            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict["charges"].view(-1)
-            en_hardness = 0.5 * (charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2)
+            en_electrostatic = charge_dict["electroneg"].view(-1) * charge_dict[
+                "charges"
+            ].view(-1)
+            en_hardness = 0.5 * (
+                charge_dict["hardness"].view(-1) * charge_dict["charges"].view(-1) ** 2
+            )
             results["energy"] += en_electrostatic + en_hardness
 
         if self.heisenberg_tf:

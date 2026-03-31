@@ -1,21 +1,28 @@
-from typing import Callable, Union, Optional, Sequence
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
-from torch import nn
 import torch.nn.functional as F
-import numpy as np
+from torch import nn
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 __all__ = ["build_mlp", "Dense"]
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Union, Callable
 
 def build_mlp(
     n_in: int,
     n_out: int,
-    n_hidden: Optional[Union[int, Sequence[int]]] = None,
+    n_hidden: int | Sequence[int] | None = None,
     n_layers: int = 2,
     activation: Callable = F.silu,
     bias: bool = True,
@@ -40,7 +47,7 @@ def build_mlp(
     if n_hidden is None:
         c_neurons = n_in
         n_neurons = []
-        for i in range(n_layers):
+        for _i in range(n_layers):
             n_neurons.append(c_neurons)
             c_neurons = max(n_out, c_neurons // 2)
         n_neurons.append(n_out)
@@ -59,12 +66,11 @@ def build_mlp(
     ]
 
     # assign a Dense layer (without activation function) to the output layer
-    layers.append(
-        Dense(n_neurons[-2], n_neurons[-1], activation=None, bias=bias)
-    )
+    layers.append(Dense(n_neurons[-2], n_neurons[-1], activation=None, bias=bias))
     # put all layers together to make the network
     out_net = nn.Sequential(*layers)
     return out_net
+
 
 class Dense(nn.Module):
     def __init__(
@@ -72,10 +78,10 @@ class Dense(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        activation: Union[Callable, nn.Module] = nn.Identity(),
+        activation: Callable | nn.Module | None = None,
     ):
         """
-        Fully connected linear layer with an optional activation function and batch normalization.
+        Fully connected linear layer with an optional activation function.
 
         Args:
             in_features (int): Number of input features.
@@ -84,13 +90,8 @@ class Dense(nn.Module):
             activation (Callable or nn.Module): Activation function. Defaults to Identity.
         """
         super().__init__()
-        # Dense layer
         self.linear = nn.Linear(in_features, out_features, bias)
-
-        # Activation function
-        self.activation = activation
-        if self.activation is None:
-            self.activation = nn.Identity()
+        self.activation = activation if activation is not None else nn.Identity()
 
     def forward(self, input: torch.Tensor):
         y = self.linear(input)

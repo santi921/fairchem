@@ -1,7 +1,14 @@
-from typing import Dict
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+"""
+
+from __future__ import annotations
+
 import torch
-from torch import nn
-from typing import List, Optional
+
 
 def grad(y: torch.Tensor, x: torch.Tensor, training: bool = True) -> torch.Tensor:
     """
@@ -17,19 +24,21 @@ def grad(y: torch.Tensor, x: torch.Tensor, training: bool = True) -> torch.Tenso
         get_imag = False
 
     if len(y.shape) == 1:
-        grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(y)]
+        grad_outputs: list[torch.Tensor | None] = [torch.ones_like(y)]
         gradient_real = torch.autograd.grad(
             outputs=[y],  # [n_graphs, ]
             inputs=[x],  # [n_nodes, 3]
             grad_outputs=grad_outputs,
-            retain_graph=(training or get_imag),  # Make sure the graph is not destroyed during training
+            retain_graph=(
+                training or get_imag
+            ),  # Make sure the graph is not destroyed during training
             create_graph=training,  # Create graph for second derivative
             allow_unused=True,  # For complete dissociation turn to true
         )[0]  # [n_nodes, 3]
         assert gradient_real is not None, "Gradient real is None"
         if get_imag:
             gradient_imag = torch.autograd.grad(
-                outputs=[y/1j],  # [n_graphs, ]
+                outputs=[y / 1j],  # [n_graphs, ]
                 inputs=[x],  # [n_nodes, 3]
                 grad_outputs=grad_outputs,
                 retain_graph=training,  # Make sure the graph is not destroyed during training
@@ -40,17 +49,19 @@ def grad(y: torch.Tensor, x: torch.Tensor, training: bool = True) -> torch.Tenso
         else:
             gradient_imag = torch.tensor(0.0, dtype=x.dtype, device=x.device)
     else:
-        dim_y = y.shape[1] 
-        grad_outputs: List[Optional[torch.Tensor]] = [torch.ones_like(y[:,0], requires_grad=True)]
+        dim_y = y.shape[1]
+        grad_outputs: list[torch.Tensor | None] = [
+            torch.ones_like(y[:, 0], requires_grad=True)
+        ]
         grad_list_real = []
         for i in range(dim_y):
             g = torch.autograd.grad(
                 outputs=[y[:, i]],  # [n_graphs, ]
-                inputs=[x],         # [n_nodes, 3]
+                inputs=[x],  # [n_nodes, 3]
                 grad_outputs=grad_outputs,
                 retain_graph=(training or (i < dim_y - 1) or get_imag),
-                create_graph=training, # Create graph for second derivative
-                allow_unused=True, # For complete dissociation turn to true
+                create_graph=training,  # Create graph for second derivative
+                allow_unused=True,  # For complete dissociation turn to true
             )[0]
             assert g is not None, f"Gradient real for channel {i} is None"
             grad_list_real.append(g)
@@ -60,12 +71,14 @@ def grad(y: torch.Tensor, x: torch.Tensor, training: bool = True) -> torch.Tenso
             grad_list_imag = []
             for i in range(dim_y):
                 g = torch.autograd.grad(
-                    outputs=[y[:, i]/1j], # [n_graphs, ]
-                    inputs=[x], # [n_nodes, 3]
+                    outputs=[y[:, i] / 1j],  # [n_graphs, ]
+                    inputs=[x],  # [n_nodes, 3]
                     grad_outputs=grad_outputs,
-                    retain_graph=(training or (i < dim_y - 1)), # Make sure the graph is not destroyed during training
-                    create_graph=training, # Create graph for second derivative
-                    allow_unused=True, # For complete dissociation turn to true
+                    retain_graph=(
+                        training or (i < dim_y - 1)
+                    ),  # Make sure the graph is not destroyed during training
+                    create_graph=training,  # Create graph for second derivative
+                    allow_unused=True,  # For complete dissociation turn to true
                 )[0]
                 assert g is not None, f"Gradient imag for channel {i} is None"
                 grad_list_imag.append(g)

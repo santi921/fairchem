@@ -1,36 +1,46 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+"""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-from typing import Optional
 
-from ..util import grad
+from fairchem.core.models.les.util import grad
 
-__all__ = ['BEC']
+__all__ = ["BEC"]
+
 
 class BEC(nn.Module):
-    def __init__(self,
-                 remove_mean: bool = True,
-                 epsilon_factor: float = 1., # \epsilon_infty
-                 ):
+    def __init__(
+        self,
+        remove_mean: bool = True,
+        epsilon_factor: float = 1.0,  # \epsilon_infty
+    ):
         super().__init__()
         self.remove_mean = remove_mean
         self.epsilon_factor = epsilon_factor
-        self.normalization_factor = epsilon_factor ** 0.5
+        self.normalization_factor = epsilon_factor**0.5
 
-    def forward(self,
-                q: torch.Tensor,  # [n_atoms, n_q]
-                r: torch.Tensor, # [n_atoms, 3]
-                cell: torch.Tensor, # [batch_size, 3, 3]
-                batch: Optional[torch.Tensor] = None,
-                output_index: Optional[int] = None, # 0, 1, 2 to select only one component
-                ) -> torch.Tensor:
-
+    def forward(
+        self,
+        q: torch.Tensor,  # [n_atoms, n_q]
+        r: torch.Tensor,  # [n_atoms, 3]
+        cell: torch.Tensor,  # [batch_size, 3, 3]
+        batch: torch.Tensor | None = None,
+        output_index: int | None = None,  # 0, 1, 2 to select only one component
+    ) -> torch.Tensor:
         if q.dim() == 1:
             q = q.unsqueeze(1)
 
         # Check the input dimension
         n, d = r.shape
-        assert d == 3, 'r dimension error'
-        assert n == q.size(0), 'q dimension error'
+        assert d == 3, "r dimension error"
+        assert n == q.size(0), "q dimension error"
 
         if batch is None:
             batch = torch.zeros(n, dtype=torch.int64, device=r.device)
@@ -38,13 +48,13 @@ class BEC(nn.Module):
 
         # compute the polarization for each batch
         all_P = []
-        all_phases = [] 
+        all_phases = []
         for i in unique_batches:
             mask = batch == i  # Create a mask for the i-th configuration
             r_now, q_now = r[mask], q[mask]
             if self.remove_mean:
                 q_now = q_now - torch.mean(q_now, dim=0, keepdim=True)
-    
+
             if cell is not None:
                 box_now = cell[i]  # Get the box for the i-th configuration
 
@@ -65,19 +75,24 @@ class BEC(nn.Module):
         phases = torch.cat(all_phases, dim=0)
 
         # take the gradient of the polarization w.r.t. the positions to get the complex BEC
-        bec_complex = grad(y=P, x=r)
-   
-        # dephase
-        result = bec_complex * phases.unsqueeze(1).conj()
+        # grad() returns [n_nodes, 3_dr, dim_y] but BEC needs P on first index
+        # needs P on first Cartesian index, so transpose last two dims
+        bec_complex = grad(y=P, x=r).transpose(1, 2).contiguous()
+
+        # dephase — phases has shape [n_nodes, 3] aligned with P direction (dim=1)
+        result = bec_complex * phases.unsqueeze(2).conj()
         return result.real
- 
+
     def compute_pol_pbc(self, r_now, q_now, box_now):
         r_frac = torch.matmul(r_now, torch.linalg.inv(box_now))
-        phase = torch.exp(1j * 2.* torch.pi * r_frac)
+        phase = torch.exp(1j * 2.0 * torch.pi * r_frac)
         S = torch.sum(q_now * phase, dim=0)
-        polarization = torch.matmul(box_now.to(S.dtype), 
-                                    S.unsqueeze(1)) / (1j * 2.* torch.pi)
+        polarization = torch.matmul(box_now.to(S.dtype), S.unsqueeze(1)) / (
+            1j * 2.0 * torch.pi
+        )
         return polarization.reshape(-1), phase
 
     def __repr__(self):
-        return f'BEC(remove_mean={self.remove_mean}, epsilon_factor={self.epsilon_factor})'
+        return (
+            f"BEC(remove_mean={self.remove_mean}, epsilon_factor={self.epsilon_factor})"
+        )
