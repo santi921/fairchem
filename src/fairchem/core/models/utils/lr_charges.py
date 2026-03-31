@@ -59,6 +59,11 @@ class LRChargePredictor(nn.Module):
         self.conv_function_tf = conv_function_tf
         self.return_bec = return_bec
 
+        if self.heisenberg_tf and self.lr_comp_size != 2:
+            raise ValueError(
+                "heisenberg_tf requires lr_comp_size=2 (alpha/beta spin channels)"
+            )
+
         # Charge prediction MLP
         self.q_output_lr = nn.Sequential(
             nn.Linear(sphere_channels, hidden_channels_lr, bias=True),
@@ -153,17 +158,15 @@ class LRChargePredictor(nn.Module):
                 results["electroneg"] = electroneg.view(-1)
 
         if self.lr_comp_size == 1:
-            results["charges"] = (
-                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
-
             if self.normalize_charges_tf:
                 charges_raw = self._normalize_single_channel(
                     charges_raw,
                     data["batch"],
                     data["charge"],
                 )
-                results["charges"] = charges_raw
+            results["charges"] = (
+                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
+            )
 
         if self.lr_comp_size == 2:
             results["charges"] = (
@@ -238,17 +241,16 @@ class LRChargePredictor(nn.Module):
                 batch=data["batch"],
             )
             # Ewald returns per-batch scalar; distribute to per-atom
+            device = data["pos"].device
+            dtype = data["pos"].dtype
             n_atoms = data["pos"].shape[0]
-            per_atom = torch.zeros(n_atoms, device=data["pos"].device)
-            natoms_per_batch = torch.zeros(
-                data["cell"].shape[0], device=data["pos"].device
-            )
-            ones = torch.ones(n_atoms, device=data["pos"].device)
+            n_batches = data["cell"].shape[0]
+            ones = torch.ones(n_atoms, device=device, dtype=dtype)
+            natoms_per_batch = torch.zeros(n_batches, device=device, dtype=dtype)
             natoms_per_batch.scatter_add_(0, data["batch"], ones)
             per_batch_energy = ewald_energy.view(-1)
             per_atom_energy = per_batch_energy / natoms_per_batch
-            per_atom = per_atom_energy[data["batch"]]
-            results["energy"] = per_atom
+            results["energy"] = per_atom_energy[data["batch"]]
 
         # Equilibration energy terms
         if self.equil_charges_tf:

@@ -581,11 +581,15 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         return set(no_wd_list)
 
 
-def _build_lr_predictor(backbone: eSCNMDBackboneLR) -> LRChargePredictor:
+def _build_lr_predictor(
+    backbone: eSCNMDBackboneLR,
+    return_bec: bool | None = None,
+) -> LRChargePredictor:
     """
     Build an LRChargePredictor from backbone config.
     """
     lr_comp_size = 2 if backbone.heisenberg_tf else 1
+    bec = backbone.return_bec if return_bec is None else return_bec
     return LRChargePredictor(
         sphere_channels=backbone.sphere_channels,
         hidden_channels_lr=backbone.hidden_channels_lr,
@@ -596,7 +600,7 @@ def _build_lr_predictor(backbone: eSCNMDBackboneLR) -> LRChargePredictor:
         heisenberg_tf=backbone.heisenberg_tf,
         use_ewald_tf=backbone.use_ewald_tf,
         conv_function_tf=backbone.conv_function_tf,
-        return_bec=backbone.return_bec,
+        return_bec=bec,
     )
 
 
@@ -617,7 +621,7 @@ def _compute_energy_with_lr(
     data: AtomicData,
     latent_charge_tf: bool,
     heisenberg_tf: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
     """
     Compute short-range + long-range energy. Returns (energy_per_system, lr_dict).
     """
@@ -765,7 +769,9 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
             backbone.sphere_channels, backbone.hidden_channels
         )
         self.lr_predictor = (
-            _build_lr_predictor(backbone) if self.latent_charge_tf else None
+            _build_lr_predictor(backbone, return_bec=False)
+            if self.latent_charge_tf
+            else None
         )
 
     def forward(
@@ -784,6 +790,8 @@ class MLP_Energy_Head_LR(nn.Module, HeadInterface):
 
         if self.reduce == "mean":
             energy = energy / data_dict["natoms"]
+        elif self.reduce != "sum":
+            raise ValueError(f"reduce must be 'sum' or 'mean', got: {self.reduce}")
         return {"energy": energy}
 
 
@@ -803,10 +811,16 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
             backbone.sphere_channels, backbone.hidden_channels
         )
         self.lr_predictor = (
-            _build_lr_predictor(backbone) if self.latent_charge_tf else None
+            _build_lr_predictor(backbone, return_bec=False)
+            if self.latent_charge_tf
+            else None
         )
 
-    def forward(self, data_dict, emb: dict[str, torch.Tensor]):
+    def forward(
+        self,
+        data_dict: AtomicData,
+        emb: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
         energy, _ = _compute_energy_with_lr(
             self.energy_block,
             self.lr_predictor,
@@ -818,4 +832,6 @@ class Linear_Energy_Head_LR(nn.Module, HeadInterface):
 
         if self.reduce == "mean":
             energy = energy / data_dict["natoms"]
+        elif self.reduce != "sum":
+            raise ValueError(f"reduce must be 'sum' or 'mean', got: {self.reduce}")
         return {"energy": energy}

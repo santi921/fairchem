@@ -135,7 +135,7 @@ def _generate_ewald_kvectors(
 
     Returns kvec_final, k_sq_final, factors (symmetry weights).
     """
-    norms = torch.norm(cell_b, dim=0)
+    norms = torch.norm(cell_b, dim=1)
     Nk_b = torch.clamp(torch.floor(norms / dl).int(), min=1)
 
     n1_range = torch.arange(-Nk_b[0], Nk_b[0] + 1, device=device, dtype=G_b.dtype)
@@ -329,11 +329,11 @@ def heisenberg_potential_full_from_edge_inds(
         # Longitudinal: (alpha_i - beta_i) * (alpha_j - beta_j)
         pairwise_potential = ((alpha_i - beta_i) * (alpha_j - beta_j)) * coupling
     elif exchange_type == "heisenberg":
-        # Full Heisenberg: S_i . S_j
-        # = alpha_i*alpha_j + beta_i*beta_j - alpha_i*beta_j - beta_i*alpha_j
-        pairwise_potential = (
-            alpha_i * alpha_j + beta_i * beta_j - alpha_i * beta_j - beta_i * alpha_j
-        ) * coupling
+        # Full Heisenberg: S_i . S_j = Ising + XY
+        # Ising: (a_i - b_i)(a_j - b_j) = aa + bb - ab - ba
+        # XY:    a_i*b_j + b_i*a_j
+        # Sum:   aa + bb (cross terms cancel)
+        pairwise_potential = (alpha_i * alpha_j + beta_i * beta_j) * coupling
     else:
         raise ValueError(
             f"Unknown exchange_type '{exchange_type}'. "
