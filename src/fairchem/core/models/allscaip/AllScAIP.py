@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 from functools import partial
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.profiler import record_function
@@ -16,29 +18,37 @@ from fairchem.core.models.allscaip.modules.graph_attention_block import (
 from fairchem.core.models.allscaip.modules.input_block import InputBlock
 from fairchem.core.models.allscaip.utils.data_preprocess import (
     data_preprocess_radius_graph,
+    unpad_results,
 )
-from fairchem.core.models.allscaip.utils.graph_utils import (
+from fairchem.core.models.allscaip.utils.nn_utils import get_feedforward
+from fairchem.core.models.base import BackboneInterface, HeadInterface
+from fairchem.core.models.escaip.utils.graph_utils import (
     compilable_scatter,
     get_displacement_and_cell,
-    unpad_results,
-    charge_renormalization,
-    charge_spin_renormalization,
-    coulomb_energy_from_src_index,
-    heisenberg_energy_from_src_index
 )
-
-from fairchem.core.models.allscaip.utils.nn_utils import (
+from fairchem.core.models.escaip.utils.nn_utils import (
     NormalizationType,
-    get_feedforward,
     get_normalization_layer,
     init_linear_weights,
     no_weight_decay,
 )
-from fairchem.core.models.base import BackboneInterface, HeadInterface
+from fairchem.core.models.uma.escn_md import GradRegressConfig
+from fairchem.core.units.mlip_unit.api.inference import (
+    CHARGE_RANGE,
+    DEFAULT_CHARGE,
+    DEFAULT_SPIN,
+    DEFAULT_SPIN_OMOL,
+    SPIN_RANGE,
+    UMATask,
+)
 
 if TYPE_CHECKING:
+    from ase import Atoms
+
     from fairchem.core.datasets.atomic_data import AtomicData
     from fairchem.core.models.allscaip.custom_types import GraphAttentionData
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+    from fairchem.core.units.mlip_unit.mlip_unit import Task
 
 
 @registry.register_model("AllScAIP_backbone")
@@ -64,6 +74,11 @@ class AllScAIPBackbone(nn.Module, BackboneInterface):
         self.regress_forces = cfg.global_cfg.regress_forces
         self.direct_forces = cfg.global_cfg.direct_forces
         self.regress_stress = cfg.global_cfg.regress_stress
+        self.regress_config = GradRegressConfig(
+            direct_forces=self.direct_forces,
+            forces=self.regress_forces,
+            stress=self.regress_stress,
+        )
         self.dataset_list = cfg.global_cfg.dataset_list
         self.max_num_elements = cfg.molecular_graph_cfg.max_num_elements
         self.max_neighbors = cfg.molecular_graph_cfg.knn_k
@@ -109,6 +124,105 @@ class AllScAIPBackbone(nn.Module, BackboneInterface):
         # log recompiles
         torch._logging.set_logs(recompiles=True)  # type: ignore
 
+    @classmethod
+    def build_inference_settings(cls, settings: InferenceSettings) -> dict:
+        """
+        Build backbone config overrides from inference settings.
+        """
+        overrides = {}
+
+        if settings.compile:
+            if settings.max_atoms is None:
+                raise ValueError(
+                    "max_atoms must be set in InferenceSettings when compile=True. "
+                    "AllScAIP requires padding to a fixed size for torch.compile."
+                )
+            overrides["use_compile"] = True
+            overrides["use_padding"] = True
+            overrides["max_atoms"] = settings.max_atoms
+        else:
+            overrides["use_compile"] = False
+            overrides["use_padding"] = False
+
+        return overrides
+
+    def validate_tasks(self, dataset_to_tasks: dict[str, list]) -> None:
+        """
+        Validate that task datasets are compatible with this backbone.
+        """
+        if self.dataset_list:
+            assert set(dataset_to_tasks.keys()).issubset(
+                set(self.dataset_list)
+            ), "Datasets in tasks is not a strict subset of datasets in backbone."
+
+    def prepare_for_inference(self, data: AtomicData, settings: InferenceSettings):
+        return self
+
+    def get_default_untrained_tasks(
+        self,
+        checkpoint_tasks: dict[str, Task],
+        inference_settings: InferenceSettings,
+    ) -> list[Task]:
+        return []
+
+    def on_predict_check(self, data: AtomicData) -> None:
+        pass
+
+    def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
+        """
+        Validate and set defaults for calculator input data.
+
+        Sets default values for charge and spin in atoms.info and validates
+        they are within acceptable ranges.
+        """
+        # Set charge defaults
+        if "charge" not in atoms.info:
+            if task_name == UMATask.OMOL.value:
+                logging.warning(
+                    "task_name='omol' detected, but charge is not set in atoms.info. "
+                    "Defaulting to charge=0. Ensure charge is an integer representing "
+                    "the total charge on the system and is within the range -100 to 100."
+                )
+            atoms.info["charge"] = DEFAULT_CHARGE
+
+        # Set spin defaults (OMOL uses spin=1, others use spin=0)
+        if "spin" not in atoms.info:
+            if task_name == UMATask.OMOL.value:
+                atoms.info["spin"] = DEFAULT_SPIN_OMOL
+                logging.warning(
+                    "task_name='omol' detected, but spin multiplicity is not set in "
+                    "atoms.info. Defaulting to spin=1. Ensure spin is an integer "
+                    "representing the spin multiplicity from 0 to 100."
+                )
+            else:
+                atoms.info["spin"] = DEFAULT_SPIN
+
+        # Validate charge range
+        charge = atoms.info["charge"]
+        if not isinstance(charge, (int, np.integer)):
+            raise TypeError(
+                f"Invalid type for charge: {type(charge)}. "
+                "Charge must be an integer representing the total charge on the system."
+            )
+        if not (CHARGE_RANGE[0] <= charge <= CHARGE_RANGE[1]):
+            raise ValueError(
+                f"Invalid value for charge: {charge}. "
+                f"Charge must be within the range {CHARGE_RANGE[0]} to {CHARGE_RANGE[1]}."
+            )
+
+        # Validate spin range
+        spin = atoms.info["spin"]
+        if not isinstance(spin, (int, np.integer)):
+            raise TypeError(
+                f"Invalid type for spin: {type(spin)}. "
+                "Spin must be an integer representing the spin multiplicity."
+            )
+        if not (SPIN_RANGE[0] <= spin <= SPIN_RANGE[1]):
+            raise ValueError(
+                f"Invalid value for spin: {spin}. "
+                f"Spin must be within the range {SPIN_RANGE[0]} to {SPIN_RANGE[1]}."
+            )
+
     def compiled_forward(self, data: GraphAttentionData):
         # input block
         with record_function("input_block"):
@@ -116,14 +230,16 @@ class AllScAIPBackbone(nn.Module, BackboneInterface):
 
         # transformer blocks
         for idx in range(self.global_cfg.num_layers):
-            with record_function(f"transformer_block_{idx}"):
-                neighbor_reps = self.transformer_blocks[idx](data, neighbor_reps)
+            neighbor_reps = self.transformer_blocks[idx](
+                data, neighbor_reps, layer_idx=idx
+            )
 
         return {
             "data": data,
             "node_reps": neighbor_reps[:, 0].to(torch.float32),
         }
 
+    @torch.compiler.disable()
     @conditional_grad(torch.enable_grad())
     def forward(self, data: AtomicData):
         # TODO: remove this when FairChem fixes this
@@ -144,13 +260,15 @@ class AllScAIPBackbone(nn.Module, BackboneInterface):
             x = self.data_preprocess(data)
 
         # compile forward function
+
         self.forward_fn = (
             torch.compile(self.compiled_forward)
             if self.global_cfg.use_compile
             else self.compiled_forward
         )
+        with record_function("backbone_compile_forward"):
+            results = self.forward_fn(x)
 
-        results = self.forward_fn(x)
         results["displacement"] = displacement
         results["orig_cell"] = orig_cell
         return results
@@ -219,7 +337,8 @@ class AllScAIPDirectForceHead(AllScAIPHeadBase):
             if self.global_cfg.use_compile
             else self.compiled_forward
         )
-        force_output = self.forward_fn(emb)  # type: ignore
+        with record_function("force_head_compile_forward"):
+            force_output = self.forward_fn(emb)  # type: ignore
         return unpad_results(
             results={"forces": force_output},
             data=emb["data"],
@@ -245,6 +364,10 @@ class AllScAIPEnergyHead(AllScAIPHeadBase):
         node_reps = self.get_node_reps(emb)
         energy_output = self.energy_ffn(node_reps)
 
+        # Mask out padded nodes to prevent them from contributing to energy
+        # (padded nodes have node_batch=0 which would incorrectly add to batch 0's energy)
+        energy_output = energy_output * emb["data"].node_padding_mask.unsqueeze(-1)
+
         # the following not compatible with torch.compile (grpah break)
         # energy_output = torch_scatter.scatter(energy_output, node_batch, dim=0, reduce="sum")
 
@@ -265,242 +388,14 @@ class AllScAIPEnergyHead(AllScAIPHeadBase):
             else self.compiled_forward
         )
 
-        energy_output = self.forward_fn(emb)  # type: ignore
+        with record_function("energy_head_compile_forward"):
+            energy_output = self.forward_fn(emb)  # type: ignore
         if len(energy_output.shape) == 0:
             energy_output = energy_output.unsqueeze(0)
         return unpad_results(
             results={"energy": energy_output},
             data=emb["data"],
         )
-
-
-@registry.register_model("AllScAIP_energy_head_lr")
-class AllScAIPEnergyHeadLR(AllScAIPHeadBase):
-    def __init__(self, backbone: AllScAIPBackbone):  # type: ignore
-        super().__init__(backbone)
-        self.energy_ffn = get_feedforward(
-            hidden_dim=self.global_cfg.hidden_size,
-            hidden_layer_multiplier=self.gnn_cfg.output_hidden_layer_multiplier,
-            output_dim=1,
-            bias=True,
-            activation=self.global_cfg.activation,
-        )
-        
-        self.latent_dim_out = 1 
-        
-        if self.gnn_cfg.heisenberg_tf: 
-            self.latent_dim_out = 2
-
-        self.charge_ffn = get_feedforward(
-            hidden_dim=self.global_cfg.hidden_size_lr,
-            input_dim=self.global_cfg.hidden_size,
-            hidden_layer_multiplier=1,
-            output_dim=self.latent_dim_out,
-            bias=True,
-            activation=None
-        )
-
-        if self.gnn_cfg.equil_charges_tf: 
-            self.hardness_ffn = get_feedforward(
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                input_dim=self.global_cfg.hidden_size,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-            self.electronegativity_ffn = get_feedforward(
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                input_dim=self.global_cfg.hidden_size,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-        if self.gnn_cfg.heisenberg_tf:
-            self.coupling_ffn = get_feedforward(
-                input_dim=1,
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-        self.energy_reduce = self.gnn_cfg.energy_reduce
-
-        self.post_init()
-
-    def compiled_forward_reps(self, emb: dict[str, torch.Tensor]):
-        node_reps = self.get_node_reps(emb)
-        return node_reps
-
-    def compiled_forward(self, emb: dict[str, torch.Tensor], node_reps):
-        energy_output = self.energy_ffn(node_reps)
-        # the following not compatible with torch.compile (graph break)
-        # energy_output = torch_scatter.scatter(energy_output, node_batch, dim=0, reduce="sum")
-        
-        energy_output = compilable_scatter(
-            src=energy_output,
-            index=emb["data"].node_batch,
-            dim_size=emb["data"].max_batch_size,
-            dim=0,
-            reduce=self.energy_reduce,
-        )
-        return energy_output.squeeze()  # Return the entire dictionary instead of just energy_output.squeeze()
-    
-    def compiled_forward_charges(self, emb: dict[str, torch.Tensor], node_reps):
-        
-        if self.latent_dim_out == 2:
-            charges_raw_2d = self.charge_ffn(node_reps) * self.gnn_cfg.charge_scale  # (N, 2)
-        
-            if self.gnn_cfg.constrain_charge:
-
-                charges_raw_2d = charge_spin_renormalization(charges_raw_2d, emb)
-                """
-                valid_charges = charges_raw_2d[:num_nodes]
-                valid_node_batch = node_batch[:num_nodes]
-
-                target_charges = emb["data"].charge[:num_graphs]
-                target_spins = emb["data"].spin[:num_graphs]
-                global_charge_spin = compilable_scatter(
-                    valid_charges, 
-                    index=valid_node_batch,
-                    dim_size=emb["data"].num_graphs,
-                    dim=0,
-                    reduce="sum"
-                )
-
-                float_target_charges = target_charges.float()
-                float_target_spins = target_spins.float()
-                global_charge = global_charge_spin.sum(dim=1)
-                global_spin = global_charge_spin[:, 0] - global_charge_spin[:, 1]
-
-                assert torch.allclose(global_charge, float_target_charges, atol=1e-3), f"Global charges {global_charge} do not match target charges {target_charges}"
-                assert torch.allclose(global_spin, float_target_spins, atol=1e-3), f"Global spins {global_spin} do not match target spins {target_spins}"
-                """
-
-            charges_raw_1d = charges_raw_2d.sum(dim=1, keepdim=True)
-            
-            energy_spin = heisenberg_energy_from_src_index(
-                q =  charges_raw_2d, 
-                src_index=emb['data'].src_index,
-                dist_pairwise=emb['data'].pairwise_distances,
-                j_coupling_nn=self.coupling_ffn,
-            )
-        
-        else:
-            charges_raw_1d = self.charge_ffn(node_reps).abs() * self.gnn_cfg.charge_scale  # (N, 1)
-        
-            if self.gnn_cfg.constrain_charge:
-                flattened_charges_raw = charges_raw_1d.squeeze(-1)
-
-                flattened_charges_raw = charge_renormalization(
-                    flattened_charges_raw, emb, eps=1e-8
-                )
-
-                # testing 
-                """
-                valid_node_batch = node_batch[:num_nodes]
-                valid_charges = flattened_charges_raw[:num_nodes]
-                valid_node_batch = node_batch[:num_nodes]
-                target_charges = emb["data"].charge[:num_graphs]
-                global_charges = compilable_scatter(
-                    valid_charges, 
-                    index=valid_node_batch,
-                    dim_size=emb["data"].num_graphs,
-                    dim=0,
-                    reduce="sum"
-                )
-                float_target_charges = target_charges.float()
-
-                assert torch.allclose(global_charges, float_target_charges, atol=1e-3), f"Global charges {global_charges} do not match target charges {target_charges}"
-                """
-                # testing 
-                   
-                charges_raw_1d = flattened_charges_raw.unsqueeze(-1)
-
-                
-        e_charge_single = coulomb_energy_from_src_index(
-            charges_raw_1d, 
-            emb['data'].src_index, 
-            emb['data'].pairwise_distances
-        )
-
-        if self.gnn_cfg.equil_charges_tf: 
-            hardness = self.hardness_ffn(node_reps)  # (N,)
-            electronegativity = self.electronegativity_ffn(node_reps)  # (N,)
-            # Additional logic for equilibration can be added here
-            en_electrostatic = (electronegativity * charges_raw_1d).view(-1)
-            en_hardness = 0.5 * (hardness * charges_raw_1d**2).view(-1)
-            e_charge_single += en_electrostatic 
-            e_charge_single += en_hardness
-
-        
-        if self.latent_dim_out == 2:
-            e_charge_single += energy_spin
-
-        e_charge = compilable_scatter(
-            e_charge_single,
-            index=emb["data"].node_batch,
-            dim_size=emb["data"].max_batch_size,
-            dim=0,
-            reduce=self.energy_reduce,
-        )        
-        
-        return e_charge
-
-    @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        #print("AllScAIPEnergyHeadLR forward called")
-        self.forward_fn_reps = (
-            torch.compile(self.compiled_forward_reps) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward_reps 
-        )
-        
-        self.forward_fn = (
-            torch.compile(self.compiled_forward) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward
-        )
-
-        self.forward_fn_coulomb = (
-            torch.compile(self.compiled_forward_charges) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward_charges
-        )
-
-        node_reps = self.forward_fn_reps(emb)   
-        energy_output_sr = self.forward_fn(emb, node_reps) 
-        e_charge = self.forward_fn_coulomb(emb, node_reps)  
-
-        if len(energy_output_sr.shape) == 0:
-            energy_output_sr = energy_output_sr.unsqueeze(0)
-        if len(e_charge.shape) == 0:
-            e_charge = e_charge.unsqueeze(0)
-        
-        # unpad once
-        results_to_unpad = {
-            "energy": energy_output_sr,
-            "energy_coul": e_charge
-        }
-        #print("results to unpad: ", results_to_unpad["energy_coul"])
-
-        res_unpad = unpad_results(
-            results=results_to_unpad,
-            data=emb["data"],
-        )
-        
-        
-        ret_dict = {
-            "energy": res_unpad["energy"] + res_unpad["energy_coul"]
-        }
-        #print("ret dict: ", ret_dict)
-        return ret_dict
-
 
 
 @registry.register_model("AllScAIP_grad_energy_force_stress_head")
@@ -531,7 +426,8 @@ class AllScAIPGradientEnergyForceStressHead(AllScAIPEnergyHead):  # type: ignore
             stress_key = "stress"
 
         outputs = {}
-        energy_output = self.compiled_forward(emb)
+        with record_function("grad_head_energy"):
+            energy_output = self.compiled_forward(emb)
         if len(energy_output.shape) == 0:
             energy_output = energy_output.unsqueeze(0)
 
@@ -540,312 +436,39 @@ class AllScAIPGradientEnergyForceStressHead(AllScAIPEnergyHead):  # type: ignore
         )
 
         if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_output.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-            outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_output.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-
-        return unpad_results(
-            results=outputs,
-            data=emb["data"],
-        )
-
-@registry.register_model("AllScAIP_grad_energy_force_stress_head_lr")
-class AllScAIPGradientEnergyForceStressHeadLR(AllScAIPEnergyHead):  # type: ignore
-    """
-    Does not support torch.compile
-    """
-
-    def __init__(
-        self,
-        backbone: AllScAIPBackbone,  # type: ignore
-        prefix: str | None = None,
-        wrap_property: bool = True,
-    ):
-        super().__init__(backbone)
-        self.prefix = prefix
-        self.wrap_property = wrap_property
-
-        self.latent_dim_out = 1 
-        
-        if self.gnn_cfg.heisenberg_tf: 
-            self.latent_dim_out = 2
-
-        self.charge_ffn = get_feedforward(
-            hidden_dim=self.global_cfg.hidden_size_lr,
-            input_dim=self.global_cfg.hidden_size,
-            hidden_layer_multiplier=1,
-            output_dim=self.latent_dim_out,
-            bias=True,
-            activation=None
-        )
-
-        if self.gnn_cfg.equil_charges_tf: 
-            self.hardness_ffn = get_feedforward(
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                input_dim=self.global_cfg.hidden_size,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-            self.electronegativity_ffn = get_feedforward(
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                input_dim=self.global_cfg.hidden_size,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-        if self.gnn_cfg.heisenberg_tf:
-            self.coupling_ffn = get_feedforward(
-                input_dim=1,
-                hidden_dim=self.global_cfg.hidden_size_lr,
-                hidden_layer_multiplier=1,
-                output_dim=1,
-                bias=True,
-                activation=None
-            )
-
-        self.energy_reduce = self.gnn_cfg.energy_reduce
-
-        self.post_init()
-
-    def compiled_forward_reps(self, emb: dict[str, torch.Tensor]):
-        node_reps = self.get_node_reps(emb)
-        return node_reps
-
-    def compiled_forward(self, emb: dict[str, torch.Tensor], node_reps):
-        energy_output = self.energy_ffn(node_reps)
-        # the following not compatible with torch.compile (graph break)
-        # energy_output = torch_scatter.scatter(energy_output, node_batch, dim=0, reduce="sum")
-        
-        energy_output = compilable_scatter(
-            src=energy_output,
-            index=emb["data"].node_batch,
-            dim_size=emb["data"].max_batch_size,
-            dim=0,
-            reduce=self.energy_reduce,
-        )
-        return energy_output.squeeze()  # Return the entire dictionary instead of just energy_output.squeeze()
-
-    def compiled_forward_charges(self, emb: dict[str, torch.Tensor], node_reps):
-
-        #num_nodes = emb["data"].num_nodes
-        #num_graphs = emb["data"].num_graphs
-        #node_batch = emb["data"].node_batch
-        with torch.enable_grad():  # Ensure gradients are enabled even during evaluation
-            if self.latent_dim_out == 2:
-                charges_raw_2d = self.charge_ffn(node_reps).abs() * self.gnn_cfg.charge_scale  # (N, 2)
-            
-                if self.gnn_cfg.constrain_charge:
-
-                    charges_raw_2d = charge_spin_renormalization(charges_raw_2d, emb)
-                    """
-                    valid_charges = charges_raw_2d[:num_nodes]
-                    valid_node_batch = node_batch[:num_nodes]
-
-                    target_charges = emb["data"].charge[:num_graphs]
-                    target_spins = emb["data"].spin[:num_graphs]
-                    global_charge_spin = compilable_scatter(
-                        valid_charges, 
-                        index=valid_node_batch,
-                        dim_size=emb["data"].num_graphs,
-                        dim=0,
-                        reduce="sum"
-                    )
-
-                    float_target_charges = target_charges.float()
-                    float_target_spins = target_spins.float()
-                    global_charge = global_charge_spin.sum(dim=1)
-                    global_spin = global_charge_spin[:, 0] - global_charge_spin[:, 1]
-
-                    assert torch.allclose(global_charge, float_target_charges, atol=1e-3), f"Global charges {global_charge} do not match target charges {target_charges}"
-                    assert torch.allclose(global_spin, float_target_spins, atol=1e-3), f"Global spins {global_spin} do not match target spins {target_spins}"
-                    """
-
-                charges_raw_1d = charges_raw_2d.sum(dim=1, keepdim=True)
-                
-                energy_spin = heisenberg_energy_from_src_index(
-                    q =  charges_raw_2d, 
-                    src_index=emb['data'].src_index,
-                    dist_pairwise=emb['data'].pairwise_distances,
-                    j_coupling_nn=self.coupling_ffn,
+            with record_function("grad_head_stress_forces"):
+                grads = torch.autograd.grad(
+                    [energy_output.sum()],
+                    [data["pos_original"], emb["displacement"]],
+                    create_graph=self.training,
                 )
-            
-            else:
-                charges_raw_1d = self.charge_ffn(node_reps).abs() * self.gnn_cfg.charge_scale  # (N, 1)
-            
-                if self.gnn_cfg.constrain_charge:
-                    flattened_charges_raw = charges_raw_1d.squeeze(-1)
 
-                    flattened_charges_raw = charge_renormalization(
-                        flattened_charges_raw, emb, eps=1e-8
-                    )
-
-                    # testing 
-                    """
-                    valid_node_batch = node_batch[:num_nodes]
-                    valid_charges = flattened_charges_raw[:num_nodes]
-                    valid_node_batch = node_batch[:num_nodes]
-                    target_charges = emb["data"].charge[:num_graphs]
-                    global_charges = compilable_scatter(
-                        valid_charges, 
-                        index=valid_node_batch,
-                        dim_size=emb["data"].num_graphs,
-                        dim=0,
-                        reduce="sum"
-                    )
-                    float_target_charges = target_charges.float()
-
-                    assert torch.allclose(global_charges, float_target_charges, atol=1e-3), f"Global charges {global_charges} do not match target charges {target_charges}"
-                    """
-                    # testing 
-                    
-                    charges_raw_1d = flattened_charges_raw.unsqueeze(-1)
-
-                    
-            e_charge_single = coulomb_energy_from_src_index(
-                charges_raw_1d, 
-                emb['data'].src_index, 
-                emb['data'].pairwise_distances
-            )
-
-            if self.gnn_cfg.equil_charges_tf: 
-                hardness = self.hardness_ffn(node_reps)  # (N,)
-                electronegativity = self.electronegativity_ffn(node_reps)  # (N,)
-                # Additional logic for equilibration can be added here
-                en_electrostatic = (electronegativity * charges_raw_1d).view(-1)
-                en_hardness = 0.5 * (hardness * charges_raw_1d**2).view(-1)
-                e_charge_single += en_electrostatic 
-                e_charge_single += en_hardness
-
-            
-            if self.latent_dim_out == 2:
-                e_charge_single += energy_spin
-
-            e_charge = compilable_scatter(
-                e_charge_single,
-                index=emb["data"].node_batch,
-                dim_size=emb["data"].max_batch_size,
-                dim=0,
-                reduce=self.energy_reduce,
-            )        
-            
-        return e_charge
-
-    @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        
-        if self.prefix:
-            energy_key = f"{self.prefix}_energy"
-            forces_key = f"{self.prefix}_forces"
-            stress_key = f"{self.prefix}_stress"
-        else:
-            energy_key = "energy"
-            forces_key = "forces"
-            stress_key = "stress"
-
-        outputs = {}
-        
-        self.forward_fn_reps = (
-            torch.compile(self.compiled_forward_reps) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward_reps 
-        )
-        
-        self.forward_fn = (
-            torch.compile(self.compiled_forward) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward
-        )
-
-        self.forward_fn_coulomb = (
-            torch.compile(self.compiled_forward_charges) 
-            if self.global_cfg.use_compile
-            else self.compiled_forward_charges
-        )
-
-        node_reps = self.forward_fn_reps(emb)   
-        energy_output_sr = self.forward_fn(emb, node_reps) 
-        e_charge = self.forward_fn_coulomb(emb, node_reps)  
-
-
-        if len(energy_output_sr.shape) == 0:
-            energy_output_sr = energy_output_sr.unsqueeze(0)
-        if len(e_charge.shape) == 0:
-            e_charge = e_charge.unsqueeze(0)
-
-        # unpad once
-        results_to_unpad = {
-            "energy": energy_output_sr,
-            "energy_coul": e_charge
-        }
-
-        res_unpad = unpad_results(
-            results=results_to_unpad,
-            data=emb["data"],
-        )
-
-        energy_output = res_unpad["energy"] + res_unpad["energy_coul"]
-
-        outputs[energy_key] = (
-            {"energy": energy_output} if self.wrap_property else energy_output
-        )        
-
-        if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_output.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-            outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        
+                forces = torch.neg(grads[0])
+                virial = grads[1].view(-1, 3, 3)
+                volume = torch.det(data["cell"]).abs().unsqueeze(-1)
+                stress = virial / volume.view(-1, 1, 1)
+                virial = torch.neg(virial)
+                stress = stress.view(
+                    -1, 9
+                )  # NOTE to work better with current Multi-task trainer
+                outputs[forces_key] = (
+                    {"forces": forces} if self.wrap_property else forces
+                )
+                outputs[stress_key] = (
+                    {"stress": stress} if self.wrap_property else stress
+                )
+                data["cell"] = emb["orig_cell"]
         elif self.regress_forces:
-            if data["pos"].requires_grad is False:
-                data["pos"].requires_grad = True
-        
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_output.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
+            with record_function("grad_head_forces"):
+                forces = (
+                    -1
+                    * torch.autograd.grad(
+                        energy_output.sum(), data["pos"], create_graph=self.training
+                    )[0]
+                )
+                outputs[forces_key] = (
+                    {"forces": forces} if self.wrap_property else forces
+                )
 
         return unpad_results(
             results=outputs,

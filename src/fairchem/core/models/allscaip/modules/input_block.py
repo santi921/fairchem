@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     )
     from fairchem.core.models.allscaip.custom_types import GraphAttentionData
 
-from fairchem.core.models.allscaip.utils.nn_utils import (
+from fairchem.core.models.escaip.utils.nn_utils import (
     Activation,
     NormalizationType,
     get_linear,

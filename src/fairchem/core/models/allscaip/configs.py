@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
-from typing import Literal, Optional
+from typing import Literal
 
 
 @dataclass
@@ -19,9 +19,9 @@ class GlobalConfigs:
     use_residual_scaling: bool = True
     use_node_path: bool = True
     dataset_list: list = field(default_factory=list)
-    # SV - lr 
-    j_coupling_hidden_dim: int = 128
-    hidden_size_lr: Optional[int] = 128
+    # MD simulation mode: single system, no padding - enables various optimizations
+    single_system_no_padding: bool = False
+
 
 @dataclass
 class MolecularGraphConfigs:
@@ -30,15 +30,20 @@ class MolecularGraphConfigs:
     max_batch_size: int
     max_radius: float
     knn_k: int
-    knn_soft: bool
-    knn_sigmoid_scale: float
-    knn_lse_scale: float
-    knn_use_low_mem: bool
-    knn_pad_size: int
+    knn_pad_size: int = 30
+    knn_soft: bool = True
+    knn_sigmoid_scale: float = 0.2
+    knn_lse_scale: float = 0.1
+    knn_use_low_mem: bool = True
     distance_function: Literal["gaussian", "sigmoid", "linearsigmoid", "silu"] = (
         "gaussian"
     )
     use_envelope: bool = True
+    # Chunked graph construction to reduce peak memory
+    use_chunked_graph: bool = False
+    graph_chunk_size: int = 512
+    # Run preprocessing on CPU to reduce GPU memory
+    preprocess_on_cpu: bool = False
 
 
 @dataclass
@@ -59,12 +64,7 @@ class GraphNeuralNetworksConfigs:
     energy_reduce: Literal["sum", "mean"] = "sum"
     use_freq_mask: bool = True
     use_sincx_mask: bool = True
-    # SV - lr 
-    constrain_charge: bool = False
-    constrain_spin: bool = False
-    heisenberg_tf: bool = False
-    equil_charges_tf: bool = False
-    charge_scale: float = 1.0
+
 
 @dataclass
 class RegularizationConfigs:

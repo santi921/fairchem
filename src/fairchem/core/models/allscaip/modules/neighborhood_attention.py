@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 from fairchem.core.models.allscaip.modules.base_attention import (
     BaseAttention,
 )
-from fairchem.core.models.allscaip.utils.nn_utils import (
+from fairchem.core.models.escaip.utils.nn_utils import (
     NormalizationType,
     get_normalization_layer,
 )

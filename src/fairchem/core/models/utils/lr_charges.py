@@ -42,6 +42,7 @@ class LRChargePredictor(nn.Module):
         normalize_charges_tf: bool = True,
         equil_charges_tf: bool = False,
         heisenberg_tf: bool = False,
+        exchange_type: str = "heisenberg",
         use_ewald_tf: bool = False,
         conv_function_tf: bool = True,
         return_bec: bool = False,
@@ -55,6 +56,7 @@ class LRChargePredictor(nn.Module):
         self.normalize_charges_tf = normalize_charges_tf
         self.equil_charges_tf = equil_charges_tf
         self.heisenberg_tf = heisenberg_tf
+        self.exchange_type = exchange_type
         self.use_ewald_tf = use_ewald_tf
         self.conv_function_tf = conv_function_tf
         self.return_bec = return_bec
@@ -269,6 +271,7 @@ class LRChargePredictor(nn.Module):
                 q=charge_dict["charges_raw"],
                 pos=data["pos"],
                 nn=self.coupling_nn,
+                exchange_type=self.exchange_type,
             )
             results["energy_spin"] = energy_spin
 

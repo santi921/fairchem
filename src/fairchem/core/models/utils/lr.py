@@ -283,7 +283,7 @@ def heisenberg_potential_full_from_edge_inds(
     edge_index: torch.Tensor,
     q: torch.Tensor,
     nn: torch.nn.Module,
-    exchange_type: str = "xy",
+    exchange_type: str = "heisenberg",
 ):
     """
     Compute spin-spin coupling energy per atom using a learned coupling J(r).

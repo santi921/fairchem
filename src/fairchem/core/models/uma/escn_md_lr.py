@@ -91,6 +91,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         # LR-specific parameters
         hidden_channels_lr: int = 64,
         heisenberg_tf: bool = False,
+        exchange_type: str = "heisenberg",
         latent_charge_tf: bool = True,
         return_bec: bool = False,
         conv_function_tf: bool = True,
@@ -227,6 +228,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         # LR-specific attributes
         self.hidden_channels_lr = hidden_channels_lr
         self.heisenberg_tf = heisenberg_tf
+        self.exchange_type = exchange_type
         self.latent_charge_tf = latent_charge_tf
         self.return_bec = return_bec
         self.conv_function_tf = conv_function_tf
@@ -598,6 +600,7 @@ def _build_lr_predictor(
         normalize_charges_tf=backbone.normalize_charges_tf,
         equil_charges_tf=backbone.equil_charges_tf,
         heisenberg_tf=backbone.heisenberg_tf,
+        exchange_type=backbone.exchange_type,
         use_ewald_tf=backbone.use_ewald_tf,
         conv_function_tf=backbone.conv_function_tf,
         return_bec=bec,
