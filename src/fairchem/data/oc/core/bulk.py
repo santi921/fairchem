@@ -8,12 +8,12 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import os
-import pickle
 import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from fairchem.core.common.safe_pickle import safe_pickle_load
 from fairchem.core.scripts import download_large_files
 from fairchem.data.oc.core.slab import Slab
 from fairchem.data.oc.databases.pkls import BULK_PKL_PATH
@@ -63,7 +63,7 @@ class Bulk:
                 if bulk_db_path == BULK_PKL_PATH and not os.path.exists(BULK_PKL_PATH):
                     download_large_files.download_file_group("oc")
                 with open(bulk_db_path, "rb") as fp:
-                    bulk_db = pickle.load(fp)
+                    bulk_db = safe_pickle_load(fp)
 
             if bulk_id_from_db is not None:
                 bulk_obj = bulk_db[bulk_id_from_db]

@@ -124,7 +124,7 @@ eval_dataloader:
 
 
 heads:
-  :
+  energyandforcehead:
     module: fairchem.core.models.uma.escn_moe.DatasetSpecificSingleHeadWrapper
     head_cls: fairchem.core.models.uma.escn_md.MLP_EFS_Head
     head_kwargs:
@@ -177,6 +177,6 @@ runner:
   callbacks:
     - _target_: fairchem.core.common.profiler_utils.ProfilerCallback
       job_config: ${job}
-    - _target_: fairchem.core.components.train.train_runner.TrainCheckpointCallback
+    - _target_: fairchem.core.components.callbacks.TrainCheckpointCallback
       checkpoint_every_n_steps: 5000
       max_saved_checkpoints: 5
