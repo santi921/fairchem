@@ -48,10 +48,10 @@ from fairchem.core.common.utils import StrEnum
 from fairchem.core.components.train.train_runner import Checkpointable
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets.collaters.mt_collater import MTCollater
-from fairchem.core.modules.normalization.element_references import (  # noqa: TC001
+from fairchem.core.modules.normalization.element_references import (  # noqa: TCH001
     ElementReferences,
 )
-from fairchem.core.modules.normalization.normalizer import Normalizer  # noqa: TC001
+from fairchem.core.modules.normalization.normalizer import Normalizer  # noqa: TCH001
 from fairchem.core.modules.scheduler import CosineLRLambda
 from fairchem.core.units.mlip_unit._metrics import Metrics, get_metrics_fn
 from fairchem.core.units.mlip_unit.api.inference import (
@@ -166,9 +166,9 @@ def initialize_finetuning_model(
     del model.output_heads
     model.output_heads = {}
     head_names_sorted = sorted(heads.keys())
-    assert len(set(head_names_sorted)) == len(head_names_sorted), (
-        "Head names must be unique!"
-    )
+    assert len(set(head_names_sorted)) == len(
+        head_names_sorted
+    ), "Head names must be unique!"
     for head_name in head_names_sorted:
         head_config = heads[head_name]
         if "module" not in head_config:
@@ -361,9 +361,9 @@ def compute_metrics(
     #     # this will cause downstream broadcast operations to be wrong and is dangerous
     #     target_masked = target_masked.view(output_size, -1)
 
-    assert target_masked.shape == pred_masked.shape, (
-        f"shape mismatch for {task} target: target: {target_masked.shape}, pred: {pred_masked.shape}"
-    )
+    assert (
+        target_masked.shape == pred_masked.shape
+    ), f"shape mismatch for {task} target: target: {target_masked.shape}, pred: {pred_masked.shape}"
 
     # TODO need a cleaner interface for this...
     # Lets package up the masked target and prediction into a dictionary,
@@ -415,9 +415,9 @@ def _get_consine_lr_scheduler(
     epochs: Optional[int] = None,
     steps: Optional[int] = None,
 ) -> torch.optim.lr_scheduler.LRScheduler:
-    assert (epochs is not None) ^ (steps is not None), (
-        "Exactly one of epochs or steps must be None/Not-None (XOR)"
-    )
+    assert (epochs is not None) ^ (
+        steps is not None
+    ), "Exactly one of epochs or steps must be None/Not-None (XOR)"
     scheduler_steps = int(epochs * n_iters_per_epoch) if steps is None else steps
     # fixed function for constructing a LambdaLR scheduler
     lambda_fn = CosineLRLambda(
