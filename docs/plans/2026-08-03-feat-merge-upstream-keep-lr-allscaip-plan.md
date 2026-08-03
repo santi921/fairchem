@@ -141,3 +141,54 @@ TF32 for training runs is now opt-in via the `tf32` flag upstream added to
 
 Note: the environment likely needs `torch 2.13` installed to run verification
 (`pip install -e packages/fairchem-core[dev]` after the merge).
+
+## Execution results (2026-08-03)
+
+Merge executed as planned. Commits on `v2_esen`:
+- `3544e51ff` — pre-merge working-tree commit + this plan doc (safety point pushed to origin)
+- `14619b29a` — merge of `upstream/main` (4 conflicts resolved per table; dedup deletions
+  and `configs/uma/training_release/` reset included in the merge commit)
+- `360979d19` — semantic fixes: `regress_config` on LR/LES/EScAIP backbones,
+  `scatter_target` migration, LES forward repair, duplicate `esen_efs_head_les` removal,
+  global TF32 removal, new smoke tests
+- `823c30895` — `TCH001` noqa restore for the pinned ruff 0.5.1
+
+Deviations from plan (discovered during execution):
+1. **Circular import** — our eager imports in `models/__init__.py` collided with
+   upstream's new ray-serve import chain (`calculate/__init__` → `batch_server` →
+   `datasets` → `transforms` → `models/__init__` → `escn_md` → `mlip_unit` →
+   `batch_server`). Fixed by making `predict.py`'s `batch_server` import lazy
+   (single call site) and keeping eager LR/LES/MoE registrations in
+   `models/__init__.py` so the ~100 configs using short registry names keep working.
+2. **LES needed more repair than expected** — its calls predated even the fused
+   wigner/envelope API; also needed the (now-required) execution backend threaded
+   through `eSCNMD_Block` / `EdgeDegreeEmbedding` constructors.
+
+### Verification results (torch 2.13.0+cu130, CUDA)
+
+| Check | Result |
+|---|---|
+| `import fairchem.core` + registry resolution of all LR/LES/MoE short names | ✅ |
+| `tests/core/models/uma/test_escn_md_lr.py` (new forward smoke tests) | ✅ 4/4 |
+| `tests/core/models/test_lr.py` (Coulomb/Ewald/Heisenberg/renorm/BEC/LES math) | ✅ 18/18 |
+| `tests/core/models/allscaip` forward + LR (incl. vmap-under-compile path) | ✅ 20/20 |
+| `tests/core/models/escaip` forward | ✅ 4/4 |
+| `tests/core/models/allscaip/test_allscaip_calculator.py` | ⚠️ needs gated HF access to `facebook/OMol25` (environmental) |
+| `InferenceSettings.max_atoms` single occurrence post-merge | ✅ |
+| `lr.py` `torch.meshgrid` uses `indexing="ij"` | ✅ (already correct) |
+
+### Training smoke runs (50 steps, `job.debug=true`, same configs as 2026-03-30 verification)
+
+| Run | Config | Loss trajectory | 2026-03-30 baseline |
+|---|---|---|---|
+| Non-periodic Coulomb LR | `fair_direct_4M_local_lr_experiment_non_periodic_small.yml` | 10.48 → 2.47 | 10.47 → 2.50 |
+| Periodic Ewald LR | `fair_direct_4M_local_lr_experiment_periodic_small.yml` | 10.36 → 2.51 | 10.35 → 2.51 |
+
+Both runs completed all 50 steps and wrote DCP checkpoints. Loss trajectories match
+the pre-merge baselines, indicating no numerical regression from the merge, the
+scatter_target migration, torch 2.8→2.13, or the removal of global TF32 (runs use
+`bf16: True`; if larger fp32-heavy runs slow down, set `runner.train_eval_unit.tf32: true`).
+
+### Follow-ups
+- [ ] Broader suite (`tests/core/models` + `tests/core/units/mlip_unit`, non-GPU): running, result pending
+- [ ] Request/renew HF access to `facebook/OMol25` to run the AllScAIP calculator tests
