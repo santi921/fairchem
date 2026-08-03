@@ -189,6 +189,22 @@ the pre-merge baselines, indicating no numerical regression from the merge, the
 scatter_target migration, torch 2.8→2.13, or the removal of global TF32 (runs use
 `bf16: True`; if larger fp32-heavy runs slow down, set `runner.train_eval_unit.tf32: true`).
 
+### Broader suite results (`tests/core/models` + `tests/core/units/mlip_unit`, non-GPU)
+
+422 collected, 400 passed, 22 failed. All 22 failures are the identical
+`httpx.HTTPStatusError: 403 Forbidden` fetching Meta's gated
+`facebook/UMA` checkpoints (`uma-s-1p1.pt`, `uma-s-1p2.pt`) — an environment
+access issue (this machine isn't on the authorized list for
+`facebook/UMA`/`facebook/OMol25`), not a merge-induced regression. Same root
+cause as the pre-existing `test_allscaip_calculator.py` gate. No other
+failures — nothing touched by the `scatter_target`/`regress_config` migration
+or the torch 2.13 upgrade broke.
+
 ### Follow-ups
-- [ ] Broader suite (`tests/core/models` + `tests/core/units/mlip_unit`, non-GPU): running, result pending
-- [ ] Request/renew HF access to `facebook/OMol25` to run the AllScAIP calculator tests
+- [ ] Request/renew HF access to `facebook/UMA` and `facebook/OMol25` on this
+  machine, then rerun `tests/core/units/mlip_unit/test_predict.py`,
+  `test_hessian_predict.py`, `test_stress_predict.py`, `test_inference_serve.py`,
+  and `tests/core/models/allscaip/test_allscaip_calculator.py` for full coverage.
+- [ ] Add `src/fairchem/core/models/les/README.md` documenting the LR/LES
+  components (Coulomb/Ewald electrostatics, Heisenberg spin coupling, charge/spin
+  renormalization), mirroring the existing `models/allscaip/README.md` convention.
