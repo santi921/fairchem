@@ -16,26 +16,27 @@ import torch.nn as nn
 from torch.profiler import record_function
 
 from fairchem.core.common import gp_utils
-from fairchem.core.common.distutils import get_device_for_local_rank
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import generate_graph
 from fairchem.core.models.base import HeadInterface
-#from fairchem.core.models.uma.common.rotation import (
+from fairchem.core.models.les import Les
+
+# from fairchem.core.models.uma.common.rotation import (
 #    init_edge_rot_mat,
 #    rotation_to_wigner,
-#)
+# )
 from fairchem.core.models.uma.common.rotation import (
     eulers_to_wigner,
     init_edge_rot_euler_angles,
 )
-
 from fairchem.core.models.uma.common.so3 import CoefficientMapping, SO3_Grid
 from fairchem.core.models.uma.nn.embedding import (
     ChgSpinEmbedding,
     DatasetEmbedding,
     EdgeDegreeEmbedding,
 )
+from fairchem.core.models.uma.nn.execution_backends import get_execution_backend
 from fairchem.core.models.uma.nn.layer_norm import (
     EquivariantLayerNormArray,
     EquivariantLayerNormArraySphericalHarmonics,
@@ -47,9 +48,8 @@ from fairchem.core.models.uma.nn.mole_utils import MOLEInterface
 from fairchem.core.models.uma.nn.radial import GaussianSmearing, PolynomialEnvelope
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
 
-
+from .escn_md import GradRegressConfig
 from .escn_md_block import eSCNMD_Block
-from ..les import Les
 
 if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
@@ -94,7 +94,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
         radius_pbc_version: int = 1,
         always_use_pbc: bool = True,
         les_n_layers: int = 3,
-        les_n_hidden: int | list[int] = [32, 16],
+        les_n_hidden: int | list[int] | None = None,
         les_add_linear_nn: bool = True,
         les_output_scaling_factor: float = 0.1,
         les_sigma: float = 1.0,
@@ -112,7 +112,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
         self.num_sphere_samples = num_sphere_samples
 
         self.les_n_layers = les_n_layers
-        self.les_n_hidden = les_n_hidden
+        self.les_n_hidden = les_n_hidden if les_n_hidden is not None else [32, 16]
         self.les_add_linear_nn = les_add_linear_nn
         self.les_output_scaling_factor = les_output_scaling_factor
         self.les_sigma = les_sigma
@@ -126,11 +126,17 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
         # in this mode, the user must be responsible for providing a large vaccum box
         # for aperiodic systems
         self.always_use_pbc = always_use_pbc
+        self.backend = get_execution_backend("general")
 
         # energy conservation related
         self.regress_forces = regress_forces
         self.direct_forces = direct_forces
         self.regress_stress = regress_stress
+        self.regress_config = GradRegressConfig(
+            direct_forces=direct_forces,
+            forces=regress_forces,
+            stress=regress_stress,
+        )
 
         # NOTE: graph construction related, to remove, except for cutoff
         self.otf_graph = otf_graph
@@ -238,6 +244,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
             rescale_factor=5.0,  # NOTE: sqrt avg degree
             mappingReduced=self.mappingReduced,
             activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+            backend=self.backend,
         )
 
         self.envelope = PolynomialEnvelope(exponent=5)
@@ -264,6 +271,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
                 self.act_type,
                 self.ff_type,
                 activation_checkpoint_chunk_size=activation_checkpoint_chunk_size,
+                backend=self.backend,
             )
             self.blocks.append(block)
 
@@ -273,7 +281,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
             num_channels=self.sphere_channels,
         )
 
-        #self.rot_mat_wigner_cuda = None  # lazily initialize this
+        # self.rot_mat_wigner_cuda = None  # lazily initialize this
         coefficient_index = self.SO3_grid["lmax_lmax"].mapping.coefficient_idx(
             self.lmax, self.mmax
         )
@@ -376,13 +384,13 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
             if self.always_use_pbc:
                 pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
             else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
+                assert (
+                    "pbc" in data_dict
+                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
                 pbc = data_dict["pbc"]
-            assert pbc.all() or (~pbc).all(), (
-                "We can only accept pbc that is all true or all false"
-            )
+            assert (
+                pbc.all() or (~pbc).all()
+            ), "We can only accept pbc that is all true or all false"
             logging.debug(f"Using radius graph gen version {self.radius_pbc_version}")
             graph_dict = generate_graph(
                 data_dict,
@@ -390,13 +398,13 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
                 max_neighbors=self.max_neighbors,
                 enforce_max_neighbors_strictly=self.enforce_max_neighbors_strictly,
                 radius_pbc_version=self.radius_pbc_version,
-                pbc=pbc
+                pbc=pbc,
             )
         else:
             # this assume edge_index is provided
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
+            assert (
+                "edge_index" in data_dict
+            ), "otf_graph is false, need to provide edge_index as input!"
             cell_per_edge = data_dict["cell"].repeat_interleave(
                 data_dict["nedges"], dim=0
             )
@@ -439,7 +447,7 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
         data_dict["atomic_numbers"] = data_dict["atomic_numbers"].long()
         data_dict["atomic_numbers_full"] = data_dict["atomic_numbers"]
         data_dict["batch_full"] = data_dict["batch"]
-        
+
         csd_mixed_emb = self.csd_embedding(
             charge=data_dict["charge"],
             spin=data_dict["spin"],
@@ -514,13 +522,16 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
             x_edge = torch.cat(
                 (edge_distance_embedding, source_embedding, target_embedding), dim=1
             )
+            # Pre-fuse envelope into wigner_inv
+            wigner_inv_envelope = wigner_and_M_mapping_inv * edge_envelope
+            # The LES backbone does not support graph parallelism, so the
+            # scatter target is always the raw edge target (edge_index[1])
+            scatter_target = graph_dict["edge_index"][1]
             x_message = self.edge_degree_embedding(
                 x_message,
                 x_edge,
-                graph_dict["edge_index"],
-                wigner_and_M_mapping_inv,
-                edge_envelope,
-                graph_dict["node_offset"],
+                scatter_target,
+                wigner_inv_envelope,
             )
 
         ###############################################################
@@ -531,13 +542,14 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
                 x_message = self.blocks[i](
                     x_message,
                     x_edge,
-                    graph_dict["edge_distance"],
                     graph_dict["edge_index"],
                     wigner_and_M_mapping,
-                    wigner_and_M_mapping_inv,
-                    edge_envelope,
+                    wigner_inv_envelope,
+                    total_atoms_across_gp_ranks=data_dict["atomic_numbers_full"].shape[
+                        0
+                    ],
                     sys_node_embedding=sys_node_embedding,
-                    node_offset=graph_dict["node_offset"],
+                    scatter_target=scatter_target,
                 )
 
         # Final layer norm
@@ -562,9 +574,9 @@ class eSCNMDBackboneLES(nn.Module, MOLEInterface):
             gp_utils.get_gp_world_size(),
         )[gp_utils.get_gp_rank()]
 
-        assert node_partition.numel() > 0, (
-            "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
-        )
+        assert (
+            node_partition.numel() > 0
+        ), "Looks like there is no atoms in this graph paralell partition. Cannot proceed"
         edge_partition = torch.where(
             torch.logical_and(
                 edge_index[1] >= node_partition.min(),
@@ -640,7 +652,7 @@ class MLP_EFS_Head_LES(nn.Module, HeadInterface):
             dl=backbone.les_dl,
             remove_mean=backbone.les_remove_mean,
             epsilon_factor=backbone.les_epsilon_factor,
-            use_atomwise=backbone.les_use_atomwise
+            use_atomwise=backbone.les_use_atomwise,
         )
 
         self.energy_block = nn.Sequential(
@@ -655,9 +667,9 @@ class MLP_EFS_Head_LES(nn.Module, HeadInterface):
         # but is currently necessary for finetuning pretrained models that did not have
         # the direct_forces flag set to False
         backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
+        assert (
+            not backbone.direct_forces
+        ), "EFS head is only used for gradient-based forces/stress."
 
     @conditional_grad(torch.enable_grad())
     def forward(
@@ -683,27 +695,26 @@ class MLP_EFS_Head_LES(nn.Module, HeadInterface):
 
         if gp_utils.initialized():
             energy_part = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy_part = energy_part
-        #print(data.keys())
-        #print("data sid", data["sid"])
-        
+        # print(data.keys())
+        # print("data sid", data["sid"])
+
         # add lr energy
         lr_energy = self.les(
-            positions=data["pos"], 
-            cell=data["cell"], 
+            positions=data["pos"],
+            cell=data["cell"],
             desc=emb["node_embedding"].narrow(1, 0, 1).squeeze(),
             batch=data["batch"],
             compute_energy=True,
             compute_bec=False,  # not used in eSCNMD
             bec_output_index=None,  # not used in eSCNMD
-            sid=data.get("sid", None)  # optional sid for the atoms
+            sid=data.get("sid", None),  # optional sid for the atoms
         )
-        
 
         energy_part = energy_part + lr_energy["E_lr"]
-        outputs[energy_key] = {"energy": energy_part} if self.wrap_property else energy_part
-        
+        outputs[energy_key] = (
+            {"energy": energy_part} if self.wrap_property else energy_part
+        )
+
         embeddings = emb["node_embedding"].detach()
         if gp_utils.initialized():
             embeddings = gp_utils.gather_from_model_parallel_region(embeddings, dim=0)
@@ -735,7 +746,7 @@ class MLP_EFS_Head_LES(nn.Module, HeadInterface):
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
             data["cell"] = emb["orig_cell"]
-        
+
         elif self.regress_forces:
             forces = (
                 -1
@@ -747,143 +758,6 @@ class MLP_EFS_Head_LES(nn.Module, HeadInterface):
                 forces = gp_utils.reduce_from_model_parallel_region(forces)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
         return outputs
-
-
-
-
-
-@registry.register_model("esen_efs_head_les")
-class MLP_EFS_Head_LES(nn.Module, HeadInterface):
-    def __init__(self, backbone, prefix=None, wrap_property=True):
-        super().__init__()
-        backbone.energy_block = None
-        backbone.force_block = None
-        self.regress_stress = backbone.regress_stress
-        self.regress_forces = backbone.regress_forces
-        self.prefix = prefix
-        self.wrap_property = wrap_property
-
-        self.sphere_channels = backbone.sphere_channels
-        self.hidden_channels = backbone.hidden_channels
-
-        self.les = Les(
-            n_in=backbone.sphere_channels,
-            n_layers=backbone.les_n_layers,
-            n_hidden=backbone.les_n_hidden,
-            add_linear_nn=backbone.les_add_linear_nn,
-            output_scaling_factor=backbone.les_output_scaling_factor,
-            sigma=backbone.les_sigma,
-            dl=backbone.les_dl,
-            remove_mean=backbone.les_remove_mean,
-            epsilon_factor=backbone.les_epsilon_factor,
-            use_atomwise=backbone.les_use_atomwise
-        )
-
-        self.energy_block = nn.Sequential(
-            nn.Linear(self.sphere_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, self.hidden_channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(self.hidden_channels, 1, bias=True),
-        )
-
-        # TODO: this is not very clean, bug-prone.
-        # but is currently necessary for finetuning pretrained models that did not have
-        # the direct_forces flag set to False
-        backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
-
-    @conditional_grad(torch.enable_grad())
-    def forward(
-        self, data: AtomicData, emb: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        if self.prefix:
-            energy_key = f"{self.prefix}_energy"
-            forces_key = f"{self.prefix}_forces"
-            stress_key = f"{self.prefix}_stress"
-        else:
-            energy_key = "energy"
-            forces_key = "forces"
-            stress_key = "stress"
-
-        outputs = {}
-        _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
-        _output = self.energy_block(_input)
-        node_energy = _output.view(-1, 1, 1)
-        energy_part = torch.zeros(
-            len(data["natoms"]), device=data["pos"].device, dtype=node_energy.dtype
-        )
-        energy_part.index_add_(0, data["batch"], node_energy.view(-1))
-
-        if gp_utils.initialized():
-            energy_part = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy_part = energy_part
-        #print(data.keys())
-        #print("data sid", data["sid"])
-        
-        # add lr energy
-        lr_energy = self.les(
-            positions=data["pos"], 
-            cell=data["cell"], 
-            desc=emb["node_embedding"].narrow(1, 0, 1).squeeze(),
-            batch=data["batch"],
-            compute_energy=True,
-            compute_bec=False,  # not used in eSCNMD
-            bec_output_index=None,  # not used in eSCNMD
-            sid=data.get("sid", None)  # optional sid for the atoms
-        )
-        
-
-        energy_part = energy_part + lr_energy["E_lr"]
-        outputs[energy_key] = {"energy": energy_part} if self.wrap_property else energy_part
-        
-        embeddings = emb["node_embedding"].detach()
-        if gp_utils.initialized():
-            embeddings = gp_utils.gather_from_model_parallel_region(embeddings, dim=0)
-
-        outputs["embeddings"] = (
-            {"embeddings": embeddings} if self.wrap_property else embeddings
-        )
-
-        if self.regress_stress:
-            grads = torch.autograd.grad(
-                [energy_part.sum()],
-                [data["pos_original"], emb["displacement"]],
-                create_graph=self.training,
-            )
-            if gp_utils.initialized():
-                grads = (
-                    gp_utils.reduce_from_model_parallel_region(grads[0]),
-                    gp_utils.reduce_from_model_parallel_region(grads[1]),
-                )
-
-            forces = torch.neg(grads[0])
-            virial = grads[1].view(-1, 3, 3)
-            volume = torch.det(data["cell"]).abs().unsqueeze(-1)
-            stress = virial / volume.view(-1, 1, 1)
-            virial = torch.neg(virial)
-            stress = stress.view(
-                -1, 9
-            )  # NOTE to work better with current Multi-task trainer
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-            outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
-            data["cell"] = emb["orig_cell"]
-        
-        elif self.regress_forces:
-            forces = (
-                -1
-                * torch.autograd.grad(
-                    energy_part.sum(), data["pos"], create_graph=self.training
-                )[0]
-            )
-            if gp_utils.initialized():
-                forces = gp_utils.reduce_from_model_parallel_region(forces)
-            outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
-        return outputs
-
 
 
 @registry.register_model("esen_energy_head_les")
@@ -909,7 +783,7 @@ class MLP_Energy_Head_LES(nn.Module, HeadInterface):
             dl=backbone.les_dl,
             remove_mean=backbone.les_remove_mean,
             epsilon_factor=backbone.les_epsilon_factor,
-            use_atomwise=backbone.les_use_atomwise
+            use_atomwise=backbone.les_use_atomwise,
         )
 
         self.energy_block = nn.Sequential(
@@ -924,9 +798,9 @@ class MLP_Energy_Head_LES(nn.Module, HeadInterface):
         # but is currently necessary for finetuning pretrained models that did not have
         # the direct_forces flag set to False
         backbone.direct_forces = False
-        assert not backbone.direct_forces, (
-            "EFS head is only used for gradient-based forces/stress."
-        )
+        assert (
+            not backbone.direct_forces
+        ), "EFS head is only used for gradient-based forces/stress."
 
     @conditional_grad(torch.enable_grad())
     def forward(
@@ -934,10 +808,10 @@ class MLP_Energy_Head_LES(nn.Module, HeadInterface):
     ) -> dict[str, torch.Tensor]:
         if self.prefix:
             energy_key = f"{self.prefix}_energy"
-            
+
         else:
             energy_key = "energy"
-        
+
         outputs = {}
         _input = emb["node_embedding"].narrow(1, 0, 1).squeeze(1)
         _output = self.energy_block(_input)
@@ -949,27 +823,26 @@ class MLP_Energy_Head_LES(nn.Module, HeadInterface):
 
         if gp_utils.initialized():
             energy_part = gp_utils.reduce_from_model_parallel_region(energy_part)
-        else:
-            energy_part = energy_part
-        #print(data.keys())
-        #print("data sid", data["sid"])
-        
+        # print(data.keys())
+        # print("data sid", data["sid"])
+
         # add lr energy
         lr_energy = self.les(
-            positions=data["pos"], 
-            cell=data["cell"], 
+            positions=data["pos"],
+            cell=data["cell"],
             desc=emb["node_embedding"].narrow(1, 0, 1).squeeze(),
             batch=data["batch"],
             compute_energy=True,
             compute_bec=False,  # not used in eSCNMD
             bec_output_index=None,  # not used in eSCNMD
-            sid=data.get("sid", None)  # optional sid for the atoms
+            sid=data.get("sid", None),  # optional sid for the atoms
         )
-        
 
         energy_part = energy_part + lr_energy["E_lr"]
-        outputs[energy_key] = {"energy": energy_part} if self.wrap_property else energy_part
-        
+        outputs[energy_key] = (
+            {"energy": energy_part} if self.wrap_property else energy_part
+        )
+
         embeddings = emb["node_embedding"].detach()
         if gp_utils.initialized():
             embeddings = gp_utils.gather_from_model_parallel_region(embeddings, dim=0)

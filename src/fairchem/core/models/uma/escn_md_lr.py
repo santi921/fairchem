@@ -45,6 +45,7 @@ from fairchem.core.models.utils.lr_charges import LRChargePredictor
 
 from .escn_md import (
     ESCNMD_DEFAULT_EDGE_ACTIVATION_CHECKPOINT_CHUNK_SIZE,
+    GradRegressConfig,
     resolve_dataset_mapping,
 )
 from .escn_md_block import eSCNMD_Block
@@ -115,6 +116,11 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
         self.regress_forces = regress_forces
         self.direct_forces = direct_forces
         self.regress_stress = regress_stress
+        self.regress_config = GradRegressConfig(
+            direct_forces=direct_forces,
+            forces=regress_forces,
+            stress=regress_stress,
+        )
 
         self.otf_graph = otf_graph
         self.max_neighbors = max_neighbors
@@ -489,12 +495,14 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
             )
             # Pre-fuse envelope into wigner_inv
             wigner_inv_envelope = wigner_and_M_mapping_inv * edge_envelope
+            # The LR backbone does not support graph parallelism, so the
+            # scatter target is always the raw edge target (edge_index[1])
+            scatter_target = graph_dict["edge_index"][1]
             x_message = self.edge_degree_embedding(
                 x_message,
                 x_edge,
-                graph_dict["edge_index"],
+                scatter_target,
                 wigner_inv_envelope,
-                graph_dict["node_offset"],
             )
 
         for i in range(self.num_layers):
@@ -509,7 +517,7 @@ class eSCNMDBackboneLR(nn.Module, MOLEInterface):
                         0
                     ],
                     sys_node_embedding=sys_node_embedding,
-                    node_offset=graph_dict["node_offset"],
+                    scatter_target=scatter_target,
                 )
 
         x_message = self.norm(x_message)

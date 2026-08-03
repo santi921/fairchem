@@ -7,22 +7,20 @@ file in the root directory of this source tree.
 
 from __future__ import annotations
 
-import torch
-
 from .uma.escn_md import (
     MLP_EFS_Head,
     MLP_Energy_Head,
     MLP_Stress_Head,
     eSCNMDBackbone,
 )
+from .uma.escn_md_les import eSCNMDBackboneLES
 from .uma.escn_md_lr import (
+    Linear_Energy_Head_LR,
     MLP_EFS_Head_LR,
     MLP_Energy_Head_LR,
-    Linear_Energy_Head_LR,
     eSCNMDBackboneLR,
 )
-
-torch.set_float32_matmul_precision("high")
+from .uma.escn_moe import eSCNMDMoeBackboneLR
 
 __all__ = [
     "MLP_EFS_Head",
@@ -32,5 +30,7 @@ __all__ = [
     "MLP_Stress_Head",
     "Linear_Energy_Head_LR",
     "eSCNMDBackbone",
+    "eSCNMDBackboneLES",
     "eSCNMDBackboneLR",
+    "eSCNMDMoeBackboneLR",
 ]

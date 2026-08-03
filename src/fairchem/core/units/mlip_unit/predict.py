@@ -35,7 +35,6 @@ from fairchem.core.common.distutils import (
     get_device_for_local_rank,
     setup_env_local_multi_gpu,
 )
-from fairchem.core.components.batch_server import get_app_handle_with_retry
 from fairchem.core.datasets.atomic_data import AtomicData, warn_if_upcasting
 from fairchem.core.models.uma.nn.execution_backends import (
     maybe_update_settings_backend,
@@ -945,6 +944,13 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         if cache_key not in cls._handle_cache:
             if ray_address and not ray.is_initialized():
                 ray.init(ray_address, namespace=namespace)
+
+            # imported here to avoid a circular import: batch_server imports
+            # datasets, whose transforms pull in fairchem.core.models, which
+            # imports this module via units.mlip_unit
+            from fairchem.core.components.batch_server import (
+                get_app_handle_with_retry,
+            )
 
             handle = get_app_handle_with_retry(deployment_name)
             cls._handle_cache[cache_key] = handle

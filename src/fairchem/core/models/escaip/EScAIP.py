@@ -39,6 +39,7 @@ from fairchem.core.models.escaip.utils.nn_utils import (
     init_linear_weights,
     no_weight_decay,
 )
+from fairchem.core.models.uma.escn_md import GradRegressConfig
 
 if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
@@ -70,6 +71,11 @@ class EScAIPBackbone(nn.Module, BackboneInterface):
         self.regress_forces = cfg.global_cfg.regress_forces
         self.direct_forces = cfg.global_cfg.direct_forces
         self.regress_stress = cfg.global_cfg.regress_stress
+        self.regress_config = GradRegressConfig(
+            direct_forces=self.direct_forces,
+            forces=self.regress_forces,
+            stress=self.regress_stress,
+        )
         self.dataset_list = cfg.global_cfg.dataset_list
         self.max_num_elements = cfg.molecular_graph_cfg.max_num_elements
         self.max_neighbors = cfg.molecular_graph_cfg.knn_k
