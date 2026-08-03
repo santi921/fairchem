@@ -72,7 +72,7 @@ val_dataset:
     # odac: ${dataset.odac_val}
     # omat: ${dataset.omat_val}
     mptrj: ${dataset.mptrj_val}
-  combined_dataset_config: { sampling: {type: temperature, temperature: 1.0} }
+  combined_dataset_config: { sampling: { type: temperature, temperature: 1.0 } }
 
 train_dataloader:
   _target_: fairchem.core.components.common.dataloader_builder.get_dataloader

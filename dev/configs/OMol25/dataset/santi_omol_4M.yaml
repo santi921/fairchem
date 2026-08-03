@@ -7,8 +7,8 @@ omol_train:
     molecule_cell_size: 120.0
     r_energy: True
     r_forces: True
-    r_data_keys: ['spin', 'charge']
-    r_edges: ${cpu_graph}
+    r_data_keys: ["spin", "charge"]
+    #r_edges: ${cpu_graph}
     radius: ${cutoff_radius}
     max_neigh: ${max_neighbors}
   key_mapping:
@@ -71,8 +71,8 @@ omol_val:
     molecule_cell_size: 120.0
     r_energy: True
     r_forces: True
-    r_data_keys: ['spin', 'charge']
-    r_edges: ${cpu_graph}
+    r_data_keys: ["spin", "charge"]
+    #r_edges: ${cpu_graph}
     radius: ${cutoff_radius}
     max_neigh: ${max_neighbors}
   key_mapping:

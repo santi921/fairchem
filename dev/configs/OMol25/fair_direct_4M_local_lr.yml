@@ -104,7 +104,7 @@ heads:
   omol_energy:
     module: esen_mlp_energy_head_lr
   omol_forces:
-    module: esen_linear_force_head
+    module: fairchem.core.models.uma.escn_md.Linear_Force_Head
 
 runner:
   _target_: fairchem.core.components.train.train_runner.TrainEvalRunner

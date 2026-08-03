@@ -1,15 +1,15 @@
-model: escnmd_moe_backbone
-moe_dropout: 0.05
-moe_layer_type: ${moe_layer_type}
-num_experts: ${num_moe_experts}
-use_composition_embedding: true
-use_global_embedding: false
+model: escnmd_backbone
+#moe_dropout: 0.05
+#moe_layer_type: ${moe_layer_type}
+#num_experts: ${num_moe_experts}
+#use_composition_embedding: true
+#use_global_embedding: false
 
 max_num_elements: 100
 sphere_channels: 128
 lmax: 2
 mmax: 2
-otf_graph: False
+otf_graph: True
 use_pbc: True
 use_pbc_single: True
 edge_channels: 128
