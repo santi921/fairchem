@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import math
 import os
@@ -20,13 +21,19 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import hydra
 import numpy as np
-import ray
 import torch
 import torch.distributed as dist
-from ray import remote
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from monty.dev import requires
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.framework import PredictUnit, State
+
+try:
+    import ray
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    ray_installed = True
+except ImportError:
+    ray_installed = False
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common.distutils import (
@@ -35,11 +42,15 @@ from fairchem.core.common.distutils import (
     get_device_for_local_rank,
     setup_env_local_multi_gpu,
 )
+from fairchem.core.components.serve_utils import get_app_handle_with_retry
 from fairchem.core.datasets.atomic_data import AtomicData, warn_if_upcasting
 from fairchem.core.models.uma.nn.execution_backends import (
+    ExecutionMode,
     maybe_update_settings_backend,
 )
 from fairchem.core.units.mlip_unit import InferenceSettings
+from fairchem.core.units.mlip_unit.api.inference import MergeMoleConsistencyError
+from fairchem.core.units.mlip_unit.api.model_spec import ModelSpec
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.single_atom_patch import (
     single_atom_prediction_from_lookup,
@@ -86,6 +97,16 @@ def collate_predictions(predict_fn):
     return collated_predict
 
 
+def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
+    regress_config = getattr(backbone, "regress_config", None)
+    if regress_config is None or regress_config.direct_forces:
+        return
+    if regress_config.forces or regress_config.stress:
+        data["pos"].requires_grad_(True)
+    if regress_config.stress:
+        data["cell"].requires_grad_(True)
+
+
 class MLIPPredictUnitProtocol(Protocol):
     def predict(self, data: AtomicData, undo_element_references: bool) -> dict: ...
 
@@ -116,29 +137,51 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         if inference_settings is None:
             inference_settings = InferenceSettings()
 
-        self.inference_settings = inference_settings
-        self._setup_threads(inference_settings)
+        # Named inference modes (e.g., default, turbo) are shared module-level instances. We keep a
+        # private copy so a change driven by a contract break does not alter other predictors.
+        self.inference_settings = copy.deepcopy(inference_settings)
+        self._inference_model_path = inference_model_path
+        self._overrides = copy.deepcopy(overrides)
+        self._requested_device = device
+        self._setup_threads(self.inference_settings)
 
         if self.inference_settings.wigner_cuda:
             logging.warning(
                 "The wigner_cuda flag is deprecated and will be removed in future versions."
             )
 
-        # Load checkpoint first to get model type; UMA compat fixups run downstream in load_inference_model.
+        self._load_model()
+        self._setup_device(device)
+
+        self.model.eval()
+        self.lazy_model_intialized = False
+        self.assert_on_nans = assert_on_nans
+        self._warned_upcast = False
+
+        if self.model.module.backbone.regress_config.direct_forces:
+            logging.warning(
+                "This is a direct-force model. Direct force predictions may lead to "
+                "discontinuities in the potential energy surface and energy conservation errors."
+            )
+
+    def _load_model(self) -> None:
+        """Load a fresh, unprepared model from the inference checkpoint."""
+        # Load checkpoint first to get model type; UMA compat fixups run downstream
+        # in load_inference_model.
         checkpoint = torch.load(
-            inference_model_path, map_location="cpu", weights_only=False
+            self._inference_model_path, map_location="cpu", weights_only=False
         )
 
         # if the model is uma-s and the execution mode is not explicitly set, default to the optimized uma-s gpu execution mode.
         # only for CUDA predict units: the fast backend uses Triton kernels that cannot run on CPU tensors.
-        if torch.device(device).type == "cuda":
+        if torch.device(self._requested_device).type == "cuda":
             self.inference_settings = maybe_update_settings_backend(
                 self.inference_settings, checkpoint.model_config
             )
 
         # Build model-specific overrides
         final_overrides = self._build_overrides_from_settings(
-            checkpoint, overrides, self.inference_settings
+            checkpoint, self._overrides, self.inference_settings
         )
 
         # Set default dtype during model construction so that non-persistent
@@ -150,7 +193,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         try:
             # Load model with overrides, passing pre-loaded checkpoint
             self.model, checkpoint = load_inference_model(
-                inference_model_path,
+                self._inference_model_path,
                 use_ema=True,
                 overrides=final_overrides,
                 preloaded_checkpoint=checkpoint,
@@ -192,19 +235,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 f"{[t.name for t in untrained_tasks]}"
             )
             self.model.module.add_tasks(untrained_tasks)
-
-        self._setup_device(device)
-
         self.model.eval()
-        self.lazy_model_intialized = False
-        self.assert_on_nans = assert_on_nans
-        self._warned_upcast = False
-
-        if self.model.module.backbone.regress_config.direct_forces:
-            logging.warning(
-                "This is a direct-force model. Direct force predictions may lead to "
-                "discontinuities in the potential energy surface and energy conservation errors."
-            )
 
     @property
     def dataset_to_tasks(self) -> dict[str, list]:
@@ -408,6 +439,33 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             if task.element_references is not None:
                 task.element_references.to(self.device)
 
+    def _fall_back_from_fast_path(
+        self, consistency_error: MergeMoleConsistencyError
+    ) -> None:
+        logging.warning(
+            "The UMA fast path (merge_mole + compile) is only available for "
+            "fixed composition, task, charge, and spin. This is optimized for "
+            "MD applications. Falling back to a less optimized version for "
+            "subsequent evaluations. "
+            f"Reason: '{consistency_error}'.\n"
+            "Use inference_settings='batch' for heterogeneous batched evaluations."
+        )
+
+        # Fall back to unmerged and uncompiled model:
+        # 1. change flags
+        self.inference_settings.merge_mole = False
+        self.inference_settings.compile = False
+        if self.inference_settings.execution_mode == ExecutionMode.UMAS_FAST_GPU:
+            self.inference_settings.execution_mode = ExecutionMode.GENERAL
+        self.lazy_model_intialized = False
+        # 2. clear old model and relative memory
+        del self.model
+        gc.collect()
+        if torch.device(self._requested_device).type == "cuda":
+            torch.cuda.empty_cache()
+        # 3. reload model with the new settings
+        self._load_model()
+
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         """
         Validate and set defaults for calculator input data.
@@ -424,7 +482,11 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self, data: AtomicData, undo_element_references: bool = True
     ) -> dict[str, torch.tensor]:
         if not self.lazy_model_intialized:
-            self._lazy_init(data)
+            try:
+                self._lazy_init(data)
+            except MergeMoleConsistencyError as error:
+                self._fall_back_from_fast_path(error)
+                self._lazy_init(data)
 
         # Handle single-atom systems (natoms==1 and pbc all False)
         # Skip this check if the model natively supports single atoms
@@ -449,8 +511,16 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             if torch.is_tensor(val) and val.is_floating_point():
                 data_device[key] = val.to(dtype)
 
+        backbone = self.model.module.backbone
+        _prepare_inference_gradients(backbone, data_device)
+
         # Model handles any per-prediction checks (e.g., MOLE consistency)
-        self.model.module.on_predict_check(data_device)
+        try:
+            self.model.module.on_predict_check(data_device)
+        except MergeMoleConsistencyError as error:
+            self._fall_back_from_fast_path(error)
+            self._lazy_init(data)
+            self.model.module.on_predict_check(data_device)
 
         return self._run_inference(data_device, undo_element_references)
 
@@ -460,6 +530,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         # Model handles its own preparation (MOLE merge, eval mode, etc.)
         self.model.module.prepare_for_inference(data, self.inference_settings)
+        # Inference differentiates outputs with respect to inputs, not weights.
+        self.model.requires_grad_(False)
 
         self.model.to(self.inference_settings.base_precision_dtype)
 
@@ -608,12 +680,20 @@ class MLIPWorkerLocal:
         return None
 
 
-@remote
 class MLIPWorker(MLIPWorkerLocal):
     pass
 
 
+if ray_installed:
+    MLIPWorker = ray.remote(MLIPWorker)
+else:
+    MLIPWorker = requires(
+        ray_installed, message="Requires `ray[serve]` to be installed"
+    )(MLIPWorker)
+
+
 class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
+    @requires(ray_installed, message="Requires `ray[serve]` to be installed")
     def __init__(
         self,
         inference_model_path: str,
@@ -835,9 +915,10 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
 
     Works with both ``BatchPredictServer`` (single model) and
     ``MultiplexedBatchPredictServer`` (on-demand model loading). For
-    multiplexed deployments, pass ``multiplexed_model_id`` to ``from_deployment_connection_info``
-    which binds the Ray Serve ``multiplexed_model_id`` to the handle so
-    that all requests are transparently routed to the correct model.
+    multiplexed deployments, pass a ``ModelSpec`` to
+    ``from_deployment_connection_info``. Its deterministic ``model_id`` is
+    bound to the Ray Serve handle for replica-affinity routing, while the
+    complete spec travels with every request.
 
     Can be constructed directly with a server handle, or via
     ``from_deployment_connection_info`` to connect to an already-running deployment.
@@ -853,35 +934,36 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
 
     _handle_cache: ClassVar[dict[str, DeploymentHandle]] = {}
 
+    @requires(ray_installed, message="Requires `ray[serve]` to be installed")
     def __init__(
         self,
         server_handle: DeploymentHandle,
-        multiplexed_model_id: str | None = None,
+        model_spec: ModelSpec | None = None,
     ):
         """
         Args:
             server_handle: Ray Serve deployment handle for a
                 ``BatchPredictServer`` or ``MultiplexedBatchPredictServer``.
-            multiplexed_model_id: Optional model identifier for multiplexed
-                deployments in the format
-                ``"checkpoint_name_or_path:settings"``. When provided, the
-                handle is configured with Ray Serve's
-                ``multiplexed_model_id`` so that all calls are routed to
-                the correct model on the server.
+            model_spec: Typed model configuration for a multiplexed deployment.
+                Its derived ``model_id`` is bound to the handle for routing, and
+                the full spec is sent with each remote call.
         """
-        if multiplexed_model_id is not None:
+        if model_spec is not None:
+            if not isinstance(model_spec, ModelSpec):
+                raise TypeError(
+                    f"model_spec must be a ModelSpec, got {type(model_spec).__name__}"
+                )
             if not server_handle.is_multiplexed.remote().result():
                 raise ValueError(
-                    f"multiplexed_model_id={multiplexed_model_id!r} was "
-                    "provided but the deployment is not a multiplexed "
-                    "server. Use MultiplexedBatchPredictServer or remove "
-                    "the multiplexed_model_id argument."
+                    f"model_spec={model_spec!r} was provided but the deployment "
+                    "is not a multiplexed server. Use "
+                    "MultiplexedBatchPredictServer or remove the model_spec argument."
                 )
             server_handle = server_handle.options(
-                multiplexed_model_id=multiplexed_model_id
+                multiplexed_model_id=model_spec.model_id
             )
         self.server_handle = server_handle
-        self._multiplexed_model_id = multiplexed_model_id
+        self._model_spec = model_spec
         # Identity-based cache for ``validate_atoms_data``.
         # ``ase_calculator.calculate()`` calls validate on every
         # optimizer step with the same ``atoms.info`` dict object;
@@ -901,14 +983,14 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         self._request_timeout_s = _resolve_batch_server_timeout()
 
     @property
-    def multiplexed_model_id(self) -> str | None:
-        """
-        The multiplexed model ID bound to this unit's server handle.
+    def model_spec(self) -> ModelSpec | None:
+        """The model configuration sent to a multiplexed deployment."""
+        return self._model_spec
 
-        Read-only — changing this after construction would have no effect
-        on the already-configured handle.
-        """
-        return self._multiplexed_model_id
+    @property
+    def multiplexed_model_id(self) -> str | None:
+        """The identity token derived from ``model_spec`` for Serve routing."""
+        return self._model_spec.model_id if self._model_spec is not None else None
 
     @classmethod
     def from_deployment_connection_info(
@@ -916,7 +998,7 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         deployment_name: str = "predict-server",
         ray_address: str | None = None,
         namespace: str | None = None,
-        multiplexed_model_id: str | None = None,
+        model_spec: ModelSpec | None = None,
     ) -> BatchServerPredictUnit:
         """
         Connect to an already-running server by deployment name.
@@ -928,9 +1010,7 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
                 is unset, assumes Ray is already initialised locally.
             namespace: Ray namespace. Falls back to
                 ``RAY_NAMESPACE_SERVE_FAIRCHEM`` env var.
-            multiplexed_model_id: Optional model identifier for multiplexed
-                deployments in the format
-                ``"checkpoint_name_or_path:settings"``.
+            model_spec: Typed model configuration for a multiplexed deployment.
 
         Returns:
             A ``BatchServerPredictUnit`` connected to the remote deployment.
@@ -945,19 +1025,12 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
             if ray_address and not ray.is_initialized():
                 ray.init(ray_address, namespace=namespace)
 
-            # imported here to avoid a circular import: batch_server imports
-            # datasets, whose transforms pull in fairchem.core.models, which
-            # imports this module via units.mlip_unit
-            from fairchem.core.components.batch_server import (
-                get_app_handle_with_retry,
-            )
-
             handle = get_app_handle_with_retry(deployment_name)
             cls._handle_cache[cache_key] = handle
 
         return cls(
             cls._handle_cache[cache_key],
-            multiplexed_model_id=multiplexed_model_id,
+            model_spec=model_spec,
         )
 
     def predict(self, data: AtomicData, undo_element_references: bool = True) -> dict:
@@ -969,9 +1042,11 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         Returns:
             Prediction dictionary
         """
-        result = self.server_handle.remote(data, undo_element_references).result(
-            timeout_s=self._request_timeout_s
-        )
+        result = self.server_handle.remote(
+            data,
+            spec=self._model_spec,
+            undo_element_references=undo_element_references,
+        ).result(timeout_s=self._request_timeout_s)
         return result
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
@@ -995,7 +1070,7 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         if key in self._validated_info_keys:
             return
         updated_info = self.server_handle.validate_atoms_data.remote(
-            dict(atoms.info), task_name
+            dict(atoms.info), task_name, spec=self._model_spec
         ).result(timeout_s=self._request_timeout_s)
         atoms.info.update(updated_info)
         self._validated_info_keys.add(key)
@@ -1003,23 +1078,23 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
     @cached_property
     def dataset_to_tasks(self) -> dict:
         return self.server_handle.get_predict_unit_attribute.remote(
-            "dataset_to_tasks"
+            "dataset_to_tasks", spec=self._model_spec
         ).result(timeout_s=self._request_timeout_s)
 
     @cached_property
     def atom_refs(self) -> dict | None:
-        return self.server_handle.get_predict_unit_attribute.remote("atom_refs").result(
-            timeout_s=self._request_timeout_s
-        )
+        return self.server_handle.get_predict_unit_attribute.remote(
+            "atom_refs", spec=self._model_spec
+        ).result(timeout_s=self._request_timeout_s)
 
     @cached_property
     def inference_settings(self) -> InferenceSettings:
         return self.server_handle.get_predict_unit_attribute.remote(
-            "inference_settings"
+            "inference_settings", spec=self._model_spec
         ).result(timeout_s=self._request_timeout_s)
 
     @cached_property
     def form_elem_refs(self) -> dict:
         return self.server_handle.get_predict_unit_attribute.remote(
-            "form_elem_refs"
+            "form_elem_refs", spec=self._model_spec
         ).result(timeout_s=self._request_timeout_s)
