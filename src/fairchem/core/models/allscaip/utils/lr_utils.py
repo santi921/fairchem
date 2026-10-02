@@ -32,10 +32,11 @@ def compilable_scatter_on_dictionary(
     return out
 
 
-def coulomb_energy_from_src_index(
+def coulomb_energy_from_pairs(
     q: torch.Tensor,
-    src_index: torch.Tensor,
+    pair_index: torch.Tensor,
     dist_pairwise: torch.Tensor,
+    pair_mask: torch.Tensor | None = None,
     eps: float = 1e-8,
     sigma: float = 1.0,
     epsilon: float = 1e-6,
@@ -43,12 +44,15 @@ def coulomb_energy_from_src_index(
     use_convergence: bool = False,
 ) -> torch.Tensor:
     """
-    Compute Coulomb energy per atom using src_index and dist_pairwise.
+    Compute Coulomb energy per atom over the given atom pairs.
 
     Args:
         q: charges, shape (N,) or (N, 1)
-        src_index: (2, N, max_neighbors), [0] is source, [1] is neighbor
+        pair_index: (2, N, K) atom indices, [0] is the atom and [1] its
+            partner. Pass graph_data.neighbor_index, not src_index (whose
+            second component is a slot rank, not an atom index).
         dist_pairwise: (N, N) pairwise distance matrix
+        pair_mask: optional (N, K) mask of pairs to include
         eps: threshold for masking zero-distance pairs
         sigma: width parameter for optional convergence function
         epsilon: shift for denominator to avoid singularity
@@ -60,12 +64,14 @@ def coulomb_energy_from_src_index(
     """
     q = q.squeeze(-1) if q.dim() > 1 else q
 
-    src, nbr = src_index[0], src_index[1]
+    src, nbr = pair_index[0], pair_index[1]
     rij = dist_pairwise[src, nbr]
     qi = q[src]
     qj = q[nbr]
 
     mask = (src != nbr) & (rij > eps)
+    if pair_mask is not None:
+        mask = mask & pair_mask
 
     if use_convergence:
         convergence_func = torch.special.erf(rij / (sigma * 1.4142135623730951))
@@ -79,11 +85,12 @@ def coulomb_energy_from_src_index(
     return energy
 
 
-def heisenberg_energy_from_src_index(
+def heisenberg_energy_from_pairs(
     q: torch.Tensor,
-    src_index: torch.Tensor,
+    pair_index: torch.Tensor,
     j_coupling_nn: torch.nn.Module,
     dist_pairwise: torch.Tensor,
+    pair_mask: torch.Tensor | None = None,
     eps: float = 1e-8,
     exchange_type: str = "heisenberg",
 ) -> torch.Tensor:
@@ -92,16 +99,17 @@ def heisenberg_energy_from_src_index(
 
     Args:
         q: spin charges (N, 2) with alpha and beta channels
-        src_index: (2, N, max_neighbors) source and neighbor indices
+        pair_index: (2, N, K) atom and partner indices
         j_coupling_nn: NN mapping distance -> coupling strength
         dist_pairwise: (N, N) pairwise distance matrix
+        pair_mask: optional (N, K) mask of pairs to include
         eps: threshold for masking self-interactions
         exchange_type: one of "heisenberg", "ising", "xy"
 
     Returns:
         Per-atom spin coupling energy, shape (N,)
     """
-    src, nbr = src_index[0], src_index[1]
+    src, nbr = pair_index[0], pair_index[1]
     rij = dist_pairwise[src, nbr]
 
     N, max_neighbors = rij.shape
@@ -117,6 +125,8 @@ def heisenberg_energy_from_src_index(
     qj_beta = qj[:, :, 1]
 
     mask = (src != nbr) & (rij > eps)
+    if pair_mask is not None:
+        mask = mask & pair_mask
 
     if exchange_type == "heisenberg":
         spin_interaction = (qi_alpha * qj_alpha + qi_beta * qj_beta) * j_coupling_vals

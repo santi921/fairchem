@@ -164,6 +164,29 @@ def test_heisenberg_exchange_types():
     ), "Heisenberg and XY should differ"
 
 
+def test_heisenberg_potential_matches_pairwise_sum():
+    """
+    Test each atom's spin energy is the sum over its own edges only.
+    """
+    torch.manual_seed(0)
+    pos = torch.randn(5, 3)
+    q = torch.randn(5, 2)
+    edge_index = torch.tensor([[0, 1, 2, 3, 1], [1, 0, 3, 2, 2]])
+    coupling_nn = torch.nn.Sequential(
+        torch.nn.Linear(1, 4), torch.nn.SiLU(), torch.nn.Linear(4, 1)
+    )
+
+    result = heisenberg_potential_full_from_edge_inds(
+        pos=pos, edge_index=edge_index, q=q, nn=coupling_nn
+    )
+
+    j, i = edge_index
+    coupling = coupling_nn((pos[j] - pos[i]).norm(dim=-1, keepdim=True)).view(-1)
+    pair = (q[i, 0] * q[j, 0] + q[i, 1] * q[j, 1]) * coupling
+    expected = torch.zeros(5).index_add_(0, i, pair)
+    assert torch.allclose(result, expected, atol=1e-6)
+
+
 def test_heisenberg_invalid_exchange_type():
     """
     Test that an invalid exchange type raises ValueError.

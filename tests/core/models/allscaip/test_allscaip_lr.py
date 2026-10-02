@@ -15,8 +15,8 @@ from fairchem.core.models.allscaip.utils.lr_utils import (
     charge_spin_renormalization,
     compilable_scatter_on_dictionary,
     compute_pairwise_distances,
-    coulomb_energy_from_src_index,
-    heisenberg_energy_from_src_index,
+    coulomb_energy_from_pairs,
+    heisenberg_energy_from_pairs,
 )
 
 # ============================================================
@@ -95,7 +95,7 @@ def test_coulomb_basic_shape():
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=4)
     q = torch.tensor([1.0, -1.0, 1.0, -1.0])
 
-    energy = coulomb_energy_from_src_index(q, src_index, dist_pairwise)
+    energy = coulomb_energy_from_pairs(q, src_index, dist_pairwise)
     assert energy.shape == (4,), f"Expected shape (4,), got {energy.shape}"
 
 
@@ -106,7 +106,7 @@ def test_coulomb_zero_charges():
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=3)
     q = torch.zeros(3)
 
-    energy = coulomb_energy_from_src_index(q, src_index, dist_pairwise)
+    energy = coulomb_energy_from_pairs(q, src_index, dist_pairwise)
     assert torch.allclose(energy, torch.zeros(3), atol=1e-8)
 
 
@@ -117,7 +117,7 @@ def test_coulomb_opposite_charges_negative():
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=2)
     q = torch.tensor([1.0, -1.0])
 
-    energy = coulomb_energy_from_src_index(q, src_index, dist_pairwise)
+    energy = coulomb_energy_from_pairs(q, src_index, dist_pairwise)
     assert energy[0].item() < 0.0, "Expected negative for +/- pair"
 
 
@@ -128,7 +128,7 @@ def test_coulomb_same_charges_positive():
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=2)
     q = torch.tensor([1.0, 1.0])
 
-    energy = coulomb_energy_from_src_index(q, src_index, dist_pairwise)
+    energy = coulomb_energy_from_pairs(q, src_index, dist_pairwise)
     assert energy[0].item() > 0.0, "Expected positive for +/+ pair"
 
 
@@ -138,12 +138,8 @@ def test_coulomb_charge_scaling():
     """
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=2)
 
-    e1 = coulomb_energy_from_src_index(
-        torch.tensor([1.0, 1.0]), src_index, dist_pairwise
-    )
-    e2 = coulomb_energy_from_src_index(
-        torch.tensor([2.0, 2.0]), src_index, dist_pairwise
-    )
+    e1 = coulomb_energy_from_pairs(torch.tensor([1.0, 1.0]), src_index, dist_pairwise)
+    e2 = coulomb_energy_from_pairs(torch.tensor([2.0, 2.0]), src_index, dist_pairwise)
 
     ratio = e2[0] / e1[0]
     assert torch.allclose(ratio, torch.tensor(4.0), atol=0.01)
@@ -156,10 +152,10 @@ def test_coulomb_convergence_reduces_magnitude():
     src_index, dist_pairwise, _ = _make_src_index_and_dist(n_atoms=2)
     q = torch.tensor([1.0, 1.0])
 
-    e_no_conv = coulomb_energy_from_src_index(
+    e_no_conv = coulomb_energy_from_pairs(
         q, src_index, dist_pairwise, use_convergence=False
     )
-    e_conv = coulomb_energy_from_src_index(
+    e_conv = coulomb_energy_from_pairs(
         q, src_index, dist_pairwise, use_convergence=True
     )
 
@@ -179,7 +175,7 @@ def test_heisenberg_basic_shape():
     q = torch.tensor([[0.8, 0.3], [0.4, 0.6], [0.5, 0.5]])
     nn_coupling = _make_coupling_nn()
 
-    energy = heisenberg_energy_from_src_index(q, src_index, nn_coupling, dist_pairwise)
+    energy = heisenberg_energy_from_pairs(q, src_index, nn_coupling, dist_pairwise)
     assert energy.shape == (3,), f"Expected shape (3,), got {energy.shape}"
 
 
@@ -191,7 +187,7 @@ def test_heisenberg_nonzero():
     q = torch.tensor([[1.0, 0.5], [0.3, -0.7]])
     nn_coupling = _make_coupling_nn()
 
-    energy = heisenberg_energy_from_src_index(q, src_index, nn_coupling, dist_pairwise)
+    energy = heisenberg_energy_from_pairs(q, src_index, nn_coupling, dist_pairwise)
     assert not torch.allclose(energy, torch.zeros(2))
 
 
@@ -205,7 +201,7 @@ def test_heisenberg_exchange_types_differ():
 
     results = {}
     for ex_type in ("heisenberg", "ising", "xy"):
-        results[ex_type] = heisenberg_energy_from_src_index(
+        results[ex_type] = heisenberg_energy_from_pairs(
             q, src_index, nn_coupling, dist_pairwise, exchange_type=ex_type
         )
 
@@ -222,7 +218,7 @@ def test_heisenberg_invalid_exchange_type():
     q = torch.tensor([[1.0, 0.5], [0.3, -0.7]])
 
     with pytest.raises(ValueError, match="invalid"):
-        heisenberg_energy_from_src_index(
+        heisenberg_energy_from_pairs(
             q,
             src_index,
             _make_coupling_nn(),
@@ -419,3 +415,89 @@ def test_compilable_scatter_on_dictionary():
 
     assert torch.allclose(result["a"], torch.tensor([3.0, 7.0]))
     assert torch.allclose(result["b"], torch.tensor([30.0, 70.0]))
+
+
+# ============================================================
+# End-to-end pair selection on a real backbone graph
+# ============================================================
+
+
+def _lr_model_and_batch(cutoff=2.5):
+    from ase.build import molecule
+
+    from fairchem.core.datasets.atomic_data import (
+        AtomicData,
+        atomicdata_list_to_batch,
+    )
+    from fairchem.core.models.allscaip.AllScAIP import AllScAIPBackbone
+    from fairchem.core.models.allscaip.AllScAIP_lr import (
+        AllScAIPGradEnergyForceStressHeadLR,
+    )
+
+    datas = []
+    for name in ("C6H6", "CH3CH2OH"):
+        atoms = molecule(name)
+        atoms.info.update(charge=0, spin=1)
+        datas.append(
+            AtomicData.from_ase(
+                atoms, task_name="omol", r_edges=False, r_data_keys=["spin", "charge"]
+            )
+        )
+    batch = atomicdata_list_to_batch(datas)
+    batch.dataset = ["omol", "omol"]
+
+    backbone = AllScAIPBackbone(
+        regress_stress=False,
+        direct_forces=False,
+        regress_forces=True,
+        hidden_size=8,
+        dataset_list=["omol"],
+        use_compile=False,
+        use_padding=False,
+        max_num_elements=100,
+        max_atoms=30,
+        max_batch_size=4,
+        max_radius=cutoff,
+        knn_k=6,
+        knn_pad_size=10,
+        num_layers=1,
+        atten_name="memory_efficient",
+        atten_num_heads=2,
+        freequency_list=[2, 2],
+    )
+    head = AllScAIPGradEnergyForceStressHeadLR(
+        backbone, wrap_property=False, lr_pairs="all"
+    )
+    return backbone, head, batch
+
+
+def test_lr_neighbor_pairs_are_real_atom_pairs():
+    torch.manual_seed(0)
+    backbone, head, batch = _lr_model_and_batch(cutoff=2.5)
+    emb = backbone(batch)
+    graph_data = emb["data"]
+    dist = compute_pairwise_distances(batch.pos, batch.batch, graph_data.num_nodes)
+
+    head.lr_module.lr_pairs = "neighbors"
+    pair_index, _ = head.lr_module._lr_pairs(graph_data, dist)
+    src, nbr = pair_index[0], pair_index[1]
+    real = src != nbr
+    assert real.any()
+    assert (dist[src[real], nbr[real]] < 2.5).all()
+    assert (batch.batch[src[real]] == batch.batch[nbr[real]]).all()
+
+
+def test_lr_all_pairs_cover_each_system():
+    torch.manual_seed(0)
+    backbone, head, batch = _lr_model_and_batch()
+    emb = backbone(batch)
+    graph_data = emb["data"]
+    dist = compute_pairwise_distances(batch.pos, batch.batch, graph_data.num_nodes)
+
+    pair_index, mask = head.lr_module._lr_pairs(graph_data, dist)
+    valid = mask & (pair_index[0] != pair_index[1])
+    natoms = batch.natoms.tolist()
+    assert valid.sum().item() == sum(n * (n - 1) for n in natoms)
+
+    out = head(batch, emb)
+    assert torch.isfinite(out["forces"]).all()

@@ -160,15 +160,16 @@ class LRChargePredictor(nn.Module):
                 results["electroneg"] = electroneg.view(-1)
 
         if self.lr_comp_size == 1:
+            # scale before normalizing so the constrained charges sum to the
+            # system total charge rather than a scaled copy of it
+            charges = charges_raw * self.lr_output_scaling_factor
             if self.normalize_charges_tf:
-                charges_raw = self._normalize_single_channel(
-                    charges_raw,
+                charges = self._normalize_single_channel(
+                    charges,
                     data["batch"],
                     data["charge"],
                 )
-            results["charges"] = (
-                charges_raw.view(-1, 1, 1) * self.lr_output_scaling_factor
-            )
+            results["charges"] = charges.view(-1, 1, 1)
 
         if self.lr_comp_size == 2:
             results["charges"] = (

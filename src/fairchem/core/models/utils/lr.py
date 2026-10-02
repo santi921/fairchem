@@ -316,7 +316,9 @@ def heisenberg_potential_full_from_edge_inds(
     edge_dist = distance_vec.norm(dim=-1).reshape(-1, 1)
     edge_dist.requires_grad_(True)
 
-    coupling = nn(edge_dist)
+    # [E]; keeping the trailing dim would broadcast the [E] spin products
+    # against it into an [E, E] outer product
+    coupling = nn(edge_dist).view(-1)
     alpha_i = q[i][:, 0]
     beta_i = q[i][:, 1]
     alpha_j = q[j][:, 0]
@@ -340,16 +342,10 @@ def heisenberg_potential_full_from_edge_inds(
             "Must be 'heisenberg', 'ising', or 'xy'."
         )
 
-    out = torch.zeros(
-        q.size(0),
-        pairwise_potential.size(1),
-        device=pairwise_potential.device,
-        dtype=pairwise_potential.dtype,
+    results = torch.zeros(
+        q.size(0), device=pairwise_potential.device, dtype=pairwise_potential.dtype
     )
-    out.scatter_add_(
-        0, i.unsqueeze(1).expand_as(pairwise_potential), pairwise_potential
-    )
-    results = out.sum(dim=1)
+    results.index_add_(0, i, pairwise_potential)
 
     return results
 

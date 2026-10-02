@@ -24,8 +24,8 @@ from fairchem.core.models.allscaip.utils.lr_utils import (
     charge_renormalization,
     charge_spin_renormalization,
     compute_pairwise_distances,
-    coulomb_energy_from_src_index,
-    heisenberg_energy_from_src_index,
+    coulomb_energy_from_pairs,
+    heisenberg_energy_from_pairs,
 )
 from fairchem.core.models.allscaip.utils.nn_utils import get_feedforward
 from fairchem.core.models.escaip.utils.graph_utils import compilable_scatter
@@ -53,6 +53,9 @@ class AllScAIPLRChargeModule(nn.Module):
         constrain_charge: enforce charge/spin conservation
         charge_scale: scaling factor for raw predicted charges
         exchange_type: spin exchange type ("heisenberg", "ising", "xy")
+        lr_pairs: "all" sums over every intra-system pair; "neighbors" reuses
+            the short-range kNN graph
+        cutoff_lr: optional pair distance cutoff in Angstrom for "all"
     """
 
     def __init__(
@@ -70,6 +73,8 @@ class AllScAIPLRChargeModule(nn.Module):
         ewald_sigma: float = 1.0,
         ewald_dl: float = 2.0,
         ewald_k_chunk_size: int = 50000,
+        lr_pairs: str = "all",
+        cutoff_lr: float | None = None,
     ):
         super().__init__()
         self.heisenberg_tf = heisenberg_tf
@@ -79,6 +84,10 @@ class AllScAIPLRChargeModule(nn.Module):
         self.exchange_type = exchange_type
         self.use_ewald_tf = use_ewald_tf
         self.conv_function_tf = conv_function_tf
+        if lr_pairs not in ("all", "neighbors"):
+            raise ValueError(f"lr_pairs must be 'all' or 'neighbors', got {lr_pairs}")
+        self.lr_pairs = lr_pairs
+        self.cutoff_lr = cutoff_lr
 
         # 2 output channels (alpha/beta) if spin coupling, else 1
         self.latent_dim_out = 2 if heisenberg_tf else 1
@@ -177,6 +186,28 @@ class AllScAIPLRChargeModule(nn.Module):
         result[:num_nodes] = per_atom_energy[valid_batch]
         return result
 
+    def _lr_pairs(
+        self, graph_data, dist_pairwise: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Atom pairs (2, N, K) and optional validity mask (N, K) for LR sums.
+        """
+        if self.lr_pairs == "neighbors":
+            # neighbor_index holds (atom, neighbor); empty slots are (i, i)
+            # and are dropped by the self-pair mask in the energy functions
+            return graph_data.neighbor_index, None
+
+        n = graph_data.node_padding_mask.shape[0]
+        idx = torch.arange(n, device=dist_pairwise.device)
+        real = graph_data.node_padding_mask.bool()
+        mask = (graph_data.node_batch[:, None] == graph_data.node_batch[None, :]) & (
+            real[:, None] & real[None, :]
+        )
+        if self.cutoff_lr is not None:
+            mask = mask & (dist_pairwise[:n, :n] < self.cutoff_lr)
+        pair_index = torch.stack([idx[:, None].expand(n, n), idx[None, :].expand(n, n)])
+        return pair_index, mask
+
     def forward(
         self,
         node_reps: torch.Tensor,
@@ -200,6 +231,7 @@ class AllScAIPLRChargeModule(nn.Module):
         dist_pairwise = compute_pairwise_distances(
             data["pos"], data["batch"], graph_data.num_nodes
         )
+        pair_index, pair_mask = self._lr_pairs(graph_data, dist_pairwise)
 
         if self.latent_dim_out == 2:
             charges_raw_2d = self.charge_ffn(node_reps) * self.charge_scale
@@ -209,10 +241,11 @@ class AllScAIPLRChargeModule(nn.Module):
 
             charges_raw_1d = charges_raw_2d.sum(dim=1, keepdim=True)
 
-            energy_spin = heisenberg_energy_from_src_index(
+            energy_spin = heisenberg_energy_from_pairs(
                 q=charges_raw_2d,
-                src_index=graph_data.src_index,
+                pair_index=pair_index,
                 dist_pairwise=dist_pairwise,
+                pair_mask=pair_mask,
                 j_coupling_nn=self.coupling_ffn,
                 exchange_type=self.exchange_type,
             )
@@ -231,10 +264,11 @@ class AllScAIPLRChargeModule(nn.Module):
                 charges_raw_1d, data, graph_data
             )
         else:
-            e_charge_single = coulomb_energy_from_src_index(
+            e_charge_single = coulomb_energy_from_pairs(
                 charges_raw_1d,
-                graph_data.src_index,
+                pair_index,
                 dist_pairwise,
+                pair_mask=pair_mask,
                 use_convergence=self.conv_function_tf,
             )
 
@@ -291,6 +325,8 @@ class AllScAIPEnergyHeadLR(AllScAIPHeadBase):
         ewald_sigma: float = 1.0,
         ewald_dl: float = 2.0,
         ewald_k_chunk_size: int = 50000,
+        lr_pairs: str = "all",
+        cutoff_lr: float | None = None,
     ):
         super().__init__(backbone)
 
@@ -318,6 +354,8 @@ class AllScAIPEnergyHeadLR(AllScAIPHeadBase):
             ewald_sigma=ewald_sigma,
             ewald_dl=ewald_dl,
             ewald_k_chunk_size=ewald_k_chunk_size,
+            lr_pairs=lr_pairs,
+            cutoff_lr=cutoff_lr,
         )
 
         self.post_init()
@@ -429,6 +467,8 @@ class AllScAIPGradEnergyForceStressHeadLR(AllScAIPEnergyHead):
         ewald_sigma: float = 1.0,
         ewald_dl: float = 2.0,
         ewald_k_chunk_size: int = 50000,
+        lr_pairs: str = "all",
+        cutoff_lr: float | None = None,
     ):
         super().__init__(backbone)
         self.prefix = prefix
@@ -448,6 +488,8 @@ class AllScAIPGradEnergyForceStressHeadLR(AllScAIPEnergyHead):
             ewald_sigma=ewald_sigma,
             ewald_dl=ewald_dl,
             ewald_k_chunk_size=ewald_k_chunk_size,
+            lr_pairs=lr_pairs,
+            cutoff_lr=cutoff_lr,
         )
 
         self.post_init()
