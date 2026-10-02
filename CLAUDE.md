@@ -357,6 +357,27 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
   batched Triton kernels, including every custom backward operator reached by
   the derivative graph.
 
+## Long-Range (LR) Component Gotchas
+
+- `molecule_cell_size` boxes molecules in a vacuum cell and sets `pbc=True`
+  (all OMol data). Never use `pbc` flags alone to decide a system is
+  isolated; check whether periodic images can reach the interaction cutoff.
+- Long-range neighbor lists must not reuse the short-range `max_neighbors`
+  cap, or a "15 A" sum silently covers only the nearest ~30 atoms.
+- AllScAIP `graph_data.src_index[1]` is a neighbor-slot rank, not an atom
+  index. Use `graph_data.neighbor_index` for (atom, neighbor) pairs.
+- Charge constraints must be additive (shift by residual / natoms) and applied
+  after any output scaling. Multiplicative rescaling zeroes every charge in
+  neutral systems; scaling after normalizing breaks the constraint.
+- Pairwise terms built from an `[E, 1]` network output and `[E]` per-edge
+  products broadcast to `[E, E]` without error. Flatten network outputs first.
+- `eSCNMDBackboneLR` subclasses `eSCNMDBackbone` and only adds
+  `edge_index_lr`; keep LR physics in the heads so upstream backbone changes
+  apply automatically.
+- Training configs reject top-level keys that are referenced only from `job`
+  (fairchem resolves `job` before its unused-key check). Put run names and
+  logger groups directly under `job`.
+
 ## Dependency Compatibility
 
 - Optional packages imported by eagerly loaded `fairchem.core` modules must use
