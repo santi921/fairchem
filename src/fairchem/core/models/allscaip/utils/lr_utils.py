@@ -153,40 +153,40 @@ def charge_renormalization(
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
-    Rescale predicted charges to match target total charge per graph.
+    Shift predicted charges so each graph sums to its target total charge.
+
+    The residual is distributed uniformly over the graph's atoms. An additive
+    correction keeps neutral systems (target 0) from collapsing to all-zero
+    charges, which a multiplicative rescale would do.
 
     Args:
         q: predicted charges, shape (N,)
         emb: dictionary with "data" key containing GraphAttentionData
-        eps: small value to avoid division by zero
+        eps: unused, kept for API compatibility
 
     Returns:
-        Rescaled charges, shape (N,)
+        Corrected charges, shape (N,)
     """
     num_nodes = emb["data"].num_nodes
     num_graphs = emb["data"].num_graphs
-    node_batch = emb["data"].node_batch
+    valid_node_batch = emb["data"].node_batch[:num_nodes]
+    target_charges = emb["data"].charge[:num_graphs].to(q.dtype)
 
     valid_charges = q[:num_nodes]
-    valid_node_batch = node_batch[:num_nodes]
-    target_charges = emb["data"].charge[:num_graphs]
-
     global_charges = compilable_scatter(
-        valid_charges,
+        valid_charges, index=valid_node_batch, dim_size=num_graphs, dim=0, reduce="sum"
+    )
+    atoms_per_graph = compilable_scatter(
+        torch.ones_like(valid_charges),
         index=valid_node_batch,
         dim_size=num_graphs,
         dim=0,
         reduce="sum",
     )
-
-    rescale_factor = torch.where(
-        torch.abs(global_charges) < eps,
-        torch.ones_like(global_charges),
-        target_charges / global_charges,
-    )
-
-    q[:num_nodes] = q[:num_nodes] * rescale_factor[valid_node_batch]
-    return q
+    shift = (target_charges - global_charges) / atoms_per_graph.clamp(min=1.0)
+    corrected = valid_charges + shift[valid_node_batch]
+    # out of place: q is part of the autograd graph for conservative forces
+    return torch.cat([corrected, q[num_nodes:]])
 
 
 def charge_spin_renormalization(

@@ -501,3 +501,25 @@ def test_lr_all_pairs_cover_each_system():
 
     out = head(batch, emb)
     assert torch.isfinite(out["forces"]).all()
+
+
+def test_charge_renormalization_keeps_neutral_charges_and_grad():
+    """
+    Neutral targets must not zero the charges, and gradients must flow.
+    """
+    node_batch = torch.tensor([0, 0, 0, 1, 1])
+    q = torch.tensor([0.4, -0.1, 0.3, 0.2, 0.5], requires_grad=True)
+    mock_data = _MockGraphAttentionData(
+        num_nodes=5,
+        num_graphs=2,
+        node_batch=node_batch,
+        charge=torch.tensor([0.0, 1.0]),
+    )
+
+    q_renorm = charge_renormalization(q, {"data": mock_data})
+
+    totals = torch.zeros(2).index_add_(0, node_batch, q_renorm)
+    assert torch.allclose(totals, torch.tensor([0.0, 1.0]), atol=1e-6)
+    assert q_renorm[:3].abs().sum() > 0
+    (q_renorm**2).sum().backward()
+    assert torch.isfinite(q.grad).all()
