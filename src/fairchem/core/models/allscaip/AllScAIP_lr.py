@@ -231,10 +231,16 @@ class AllScAIPLRChargeModule(nn.Module):
         dist_pairwise = compute_pairwise_distances(
             data["pos"], data["batch"], graph_data.num_nodes
         )
+        # with padding (direct forces) node tensors span max_atoms slots while
+        # pos holds only real atoms; padded pairs are masked downstream
+        num_padded = graph_data.node_padding_mask.shape[0]
+        if dist_pairwise.shape[0] < num_padded:
+            pad = num_padded - dist_pairwise.shape[0]
+            dist_pairwise = torch.nn.functional.pad(dist_pairwise, (0, pad, 0, pad))
         pair_index, pair_mask = self._lr_pairs(graph_data, dist_pairwise)
 
         if self.latent_dim_out == 2:
-            charges_raw_2d = self.charge_ffn(node_reps) * self.charge_scale
+            charges_raw_2d = self.charge_ffn(node_reps).float() * self.charge_scale
 
             if self.constrain_charge:
                 charges_raw_2d = charge_spin_renormalization(charges_raw_2d, emb)
@@ -250,7 +256,7 @@ class AllScAIPLRChargeModule(nn.Module):
                 exchange_type=self.exchange_type,
             )
         else:
-            charges_raw_1d = self.charge_ffn(node_reps) * self.charge_scale
+            charges_raw_1d = self.charge_ffn(node_reps).float() * self.charge_scale
 
             if self.constrain_charge:
                 flattened = charge_renormalization(

@@ -523,3 +523,56 @@ def test_charge_renormalization_keeps_neutral_charges_and_grad():
     assert q_renorm[:3].abs().sum() > 0
     (q_renorm**2).sum().backward()
     assert torch.isfinite(q.grad).all()
+
+
+def test_lr_energy_head_with_padded_direct_backbone():
+    """
+    Direct-force training pads nodes to max_atoms; LR pairs must still index
+    a distance matrix of matching size.
+    """
+    from ase.build import molecule
+
+    from fairchem.core.datasets.atomic_data import (
+        AtomicData,
+        atomicdata_list_to_batch,
+    )
+    from fairchem.core.models.allscaip.AllScAIP import AllScAIPBackbone
+    from fairchem.core.models.allscaip.AllScAIP_lr import AllScAIPEnergyHeadLR
+
+    torch.manual_seed(0)
+    datas = []
+    for name in ("C6H6", "H2O"):
+        atoms = molecule(name)
+        atoms.info.update(charge=0, spin=1)
+        datas.append(
+            AtomicData.from_ase(
+                atoms, task_name="omol", r_edges=False, r_data_keys=["spin", "charge"]
+            )
+        )
+    batch = atomicdata_list_to_batch(datas)
+    batch.dataset = ["omol", "omol"]
+
+    backbone = AllScAIPBackbone(
+        regress_stress=False,
+        direct_forces=True,
+        regress_forces=True,
+        hidden_size=8,
+        dataset_list=["omol"],
+        use_compile=False,
+        use_padding=True,
+        max_num_elements=100,
+        max_atoms=40,
+        max_batch_size=4,
+        max_radius=6.0,
+        knn_k=6,
+        knn_pad_size=10,
+        num_layers=1,
+        atten_name="memory_efficient",
+        atten_num_heads=2,
+        freequency_list=[2, 2],
+    )
+    head = AllScAIPEnergyHeadLR(backbone, constrain_charge=True, heisenberg_tf=True)
+
+    out = head(batch, backbone(batch))
+
+    assert torch.isfinite(out["energy"]).all()

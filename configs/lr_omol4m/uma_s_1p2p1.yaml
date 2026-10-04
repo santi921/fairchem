@@ -1,5 +1,5 @@
-# UMA-S-1.2.1 architecture trained from scratch on OMol-4M, with or without
-# long-range components. Select the arm with the uma_lr group:
+# UMA-S-1.2.1 architecture (8 experts instead of 64) trained from scratch on
+# OMol-4M, with or without long-range components. Select the arm with the uma_lr group:
 #   fairchem -c configs/lr_omol4m/uma_s_1p2p1.yaml uma_lr=coulomb
 # Arms: none, coulomb, coulomb_6A, coulomb_12A, coulomb_heis, coulomb_equil
 defaults:
@@ -41,7 +41,7 @@ backbone:
   dataset_mapping:
     omol: omol
   charge_balanced_channels: [0, 1, 2]
-  num_experts: 64
+  num_experts: 8  # 1.2.1 uses 64; 8 trains at the same speed with fewer params
   moe_dropout: 0.05
   moe_layer_type: pytorch
   use_composition_embedding: true

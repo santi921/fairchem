@@ -151,7 +151,8 @@ class LRChargePredictor(nn.Module):
         """
         results = {}
         with torch.enable_grad():
-            charges_raw = self.q_output_lr(node_features)
+            # fp32 charges keep the Coulomb sums precise under bf16 autocast
+            charges_raw = self.q_output_lr(node_features).float()
 
             if self.equil_charges_tf:
                 hardness = self.hardness_output_lr(node_features)
