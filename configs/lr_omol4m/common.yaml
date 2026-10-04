@@ -25,7 +25,7 @@ job:
     project: lr-omol4m
 
 seed: 0
-epochs: 8
+epochs: 5  # ~11-12 h/epoch for UMA-S-1p2p1 on 4x A100 (1.5k atoms/s/GPU); fits 72 h
 steps: null
 lr: 4.e-4
 max_atoms: 600

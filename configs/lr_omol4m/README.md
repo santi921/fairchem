@@ -47,10 +47,13 @@ allocation instead, with no automatic requeue.
    val splits (biomolecules, electrolytes, metal complexes, neutral organics)
    filter on `data_ids` in the val `metadata.npz`. If that key is missing,
    delete those splits from `dataset/omol_4M.yaml`.
-2. **Budget.** `epochs: 8` is a placeholder. From the smoke run, read
-   atoms/s and set `epochs` so that
-   `epochs * total_train_atoms / atoms_per_s` fits in about 70h. All arms in
-   a comparison must use the same `epochs`.
+2. **Budget.** One OMol-4M epoch is 218.7M atoms. UMA-S-1.2.1 measured
+   about 1,520 atoms/s per A100 (fp32 + TF32, `max_atoms` 600), so an epoch
+   takes about 11-12 h on one node including evals and checkpoints.
+   `epochs: 5` (about 58 h) fits the 72 h requeue budget with margin. A run
+   that times out never finishes its cosine schedule, so check the first
+   hour's 4-GPU atoms/s before committing. All arms in a comparison must use
+   the same `epochs`.
 3. **Memory.** `max_atoms` is per GPU: 600 for UMA (about 15 GB activations
    with `max_neighbors: 300`) and 350 for AllScAIP. Lower it if a run hits
    OOM on 40 GB A100s, and keep it the same across arms of one architecture.
