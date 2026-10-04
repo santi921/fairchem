@@ -374,6 +374,9 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
 - `eSCNMDBackboneLR` subclasses `eSCNMDBackbone` and only adds
   `edge_index_lr`; keep LR physics in the heads so upstream backbone changes
   apply automatically.
+- The repo `.gitignore` ignores `*yaml`, `*yml`, `*pt` and `*ipynb`, so new
+  configs are silently left out of commits. Add them with `git add -f` and
+  confirm with `git ls-files` before pushing.
 - Training configs reject top-level keys that are referenced only from `job`
   (fairchem resolves `job` before its unused-key check). Put run names and
   logger groups directly under `job`.

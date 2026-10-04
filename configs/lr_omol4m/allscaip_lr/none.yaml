@@ -1,0 +1,5 @@
+# Baseline AllScAIP conservative head (no long-range terms).
+name: nolr
+head_cls: fairchem.core.models.allscaip.AllScAIP.AllScAIPGradientEnergyForceStressHead
+head_kwargs:
+  wrap_property: False

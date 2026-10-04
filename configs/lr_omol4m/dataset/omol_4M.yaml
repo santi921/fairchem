@@ -1,0 +1,79 @@
+# OMol25 4M training split and validation set (ase_db / aselmdb).
+# Molecules are boxed in a 120 A vacuum cell (pbc=True); the LR backbone
+# detects that no periodic image is within reach and uses exact
+# intra-molecule pairs for the long-range sums.
+#
+# The per-domain val splits filter on metadata "data_ids", which the OMol25
+# release ships in metadata.npz next to the val lmdbs. Domains most likely to
+# show long-range effects: biomolecules, electrolytes, metal complexes.
+
+omol_train:
+  splits:
+    train:
+      src: ${cluster.omol_4M_train_path}
+  format: ase_db
+  a2g_args:
+    molecule_cell_size: 120.0
+    r_energy: True
+    r_forces: True
+    r_data_keys: ['spin', 'charge']
+  key_mapping:
+    energy: omol_energy
+    forces: omol_forces
+  transforms:
+    common_transform:
+      dataset_name: omol
+
+omol_val:
+  splits:
+    val:
+      sample_n: 20000
+      src: ${cluster.omol_val_path}
+    val_biomolecules:
+      sample_n: 20000
+      src: ${cluster.omol_val_path}
+      subset_to:
+        - op: in
+          metadata_key: data_ids
+          rhv:
+            - biomolecules
+    val_electrolytes:
+      sample_n: 20000
+      src: ${cluster.omol_val_path}
+      subset_to:
+        - op: in
+          metadata_key: data_ids
+          rhv:
+            - elytes
+    val_metal_complexes:
+      sample_n: 20000
+      src: ${cluster.omol_val_path}
+      subset_to:
+        - op: in
+          metadata_key: data_ids
+          rhv:
+            - metal_complexes
+    val_neutral_organics:
+      sample_n: 20000
+      src: ${cluster.omol_val_path}
+      subset_to:
+        - op: in
+          metadata_key: data_ids
+          rhv:
+            - ani2x
+            - orbnet_denali
+            - geom_orca6
+            - trans1x
+            - rgd
+  format: ase_db
+  a2g_args:
+    molecule_cell_size: 120.0
+    r_energy: True
+    r_forces: True
+    r_data_keys: ['spin', 'charge']
+  key_mapping:
+    energy: omol_energy
+    forces: omol_forces
+  transforms:
+    common_transform:
+      dataset_name: omol

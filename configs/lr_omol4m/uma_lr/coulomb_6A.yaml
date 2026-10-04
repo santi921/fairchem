@@ -1,0 +1,7 @@
+# Placebo control: identical charge head, but pairs limited to the 6 A
+# short-range cutoff. Gains over this arm are attributable to range.
+name: coul_6A
+latent_charge_tf: true
+heisenberg_tf: false
+equil_charges_tf: false
+cutoff_lr: 6.0

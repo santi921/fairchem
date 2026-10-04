@@ -1,0 +1,22 @@
+# NERSC Perlmutter GPU nodes: 4x A100 per node, 64 cores / 128 threads.
+# SLURM mode submits through submitit, which checkpoints on timeout and
+# requeues (up to 3 times), so a run can span several 24h allocations.
+mode: SLURM
+device: CUDA
+num_nodes: 1
+ranks_per_node: 4
+dataloader_workers: 8
+cpus_per_task: 32
+mem_gb: 0  # whole node
+timeout_hr: 24
+account: m3278_g
+qos: regular
+additional_parameters:
+  constraint: gpu
+  mail-user: santiagovargas@lbl.gov
+  mail-type: ALL
+
+run_dir: /pscratch/sd/s/santiago/lr_experiments
+data_root: /pscratch/sd/s/santiago/mlip_data
+omol_4M_train_path: ${cluster.data_root}/train_4M
+omol_val_path: ${cluster.data_root}/val

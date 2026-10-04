@@ -1,0 +1,9 @@
+# Latent-charge Coulomb over every intra-molecule pair.
+name: coul_all
+head_cls: fairchem.core.models.allscaip.AllScAIP_lr.AllScAIPGradEnergyForceStressHeadLR
+head_kwargs:
+  wrap_property: False
+  lr_pairs: all
+  cutoff_lr: null
+  constrain_charge: True
+  heisenberg_tf: False

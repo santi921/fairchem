@@ -1,0 +1,9 @@
+# Placebo control: Coulomb restricted to the 6 A short-range cutoff.
+name: coul_6A
+head_cls: fairchem.core.models.allscaip.AllScAIP_lr.AllScAIPGradEnergyForceStressHeadLR
+head_kwargs:
+  wrap_property: False
+  lr_pairs: all
+  cutoff_lr: 6.0
+  constrain_charge: True
+  heisenberg_tf: False

@@ -1,0 +1,7 @@
+# Latent-charge Coulomb over every intra-molecule pair, charges constrained
+# to the total charge.
+name: coul_all
+latent_charge_tf: true
+heisenberg_tf: false
+equil_charges_tf: false
+cutoff_lr: null

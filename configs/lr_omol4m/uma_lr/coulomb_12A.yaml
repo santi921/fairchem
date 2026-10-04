@@ -1,0 +1,6 @@
+# Range ablation between the 6 A placebo and all pairs.
+name: coul_12A
+latent_charge_tf: true
+heisenberg_tf: false
+equil_charges_tf: false
+cutoff_lr: 12.0

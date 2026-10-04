@@ -1,0 +1,6 @@
+# Baseline: same LR backbone/head code path with the long-range terms off.
+name: nolr
+latent_charge_tf: false
+heisenberg_tf: false
+equil_charges_tf: false
+cutoff_lr: null

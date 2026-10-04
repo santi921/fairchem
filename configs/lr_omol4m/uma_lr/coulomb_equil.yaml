@@ -1,0 +1,6 @@
+# Coulomb plus learned electronegativity/hardness charge-equilibration terms.
+name: coul_equil_all
+latent_charge_tf: true
+heisenberg_tf: false
+equil_charges_tf: true
+cutoff_lr: null

@@ -1,0 +1,8 @@
+# Coulomb plus learned Heisenberg spin exchange (alpha/beta charge channels,
+# constrained to the total charge and spin). J(r) is an unconstrained MLP of
+# distance applied over the same all-pair graph.
+name: coul_heis_all
+latent_charge_tf: true
+heisenberg_tf: true
+equil_charges_tf: false
+cutoff_lr: null

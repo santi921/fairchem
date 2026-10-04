@@ -1,0 +1,71 @@
+# UMA-S-1.2.1 architecture trained from scratch on OMol-4M, with or without
+# long-range components. Select the arm with the uma_lr group:
+#   fairchem -c configs/lr_omol4m/uma_s_1p2p1.yaml uma_lr=coulomb
+# Arms: none, coulomb, coulomb_6A, coulomb_12A, coulomb_heis, coulomb_equil
+defaults:
+  - cluster: perlmutter
+  - dataset: omol_4M
+  - element_refs: omol_hof_lin_refs
+  - tasks: omol_conserving
+  - uma_lr: coulomb
+  - common
+  - _self_
+
+job:
+  run_name: uma_s_1p2p1_omol4m_${uma_lr.name}_s${seed}
+  logger:
+    group: uma_s_1p2p1
+
+max_neighbors: 300  # effectively uncapped at 6 A, as in the 1.2.1 release
+
+backbone:
+  model: escnmd_moe_backbone_lr
+  # UMA-S-1.2.1 architecture (from the uma-s-1p2p1 checkpoint config)
+  max_num_elements: 100
+  sphere_channels: 128
+  hidden_channels: 128
+  edge_channels: 128
+  lmax: 2
+  mmax: 2
+  num_layers: 4
+  cutoff: ${cutoff_radius}
+  max_neighbors: ${max_neighbors}
+  distance_function: gaussian
+  num_distance_basis: 32
+  norm_type: rms_norm_sh
+  act_type: gate
+  ff_type: spectral
+  chg_spin_emb_type: rand_emb
+  cs_emb_grad: true
+  dataset_emb_grad: true
+  dataset_mapping:
+    omol: omol
+  charge_balanced_channels: [0, 1, 2]
+  num_experts: 64
+  moe_dropout: 0.05
+  moe_layer_type: pytorch
+  use_composition_embedding: true
+  use_global_embedding: false
+  composition_dropout: 0.1
+  otf_graph: true
+  use_pbc: true
+  use_pbc_single: true
+  regress_forces: true
+  regress_stress: false
+  direct_forces: false
+  # long-range settings (uma_lr group)
+  latent_charge_tf: ${uma_lr.latent_charge_tf}
+  heisenberg_tf: ${uma_lr.heisenberg_tf}
+  equil_charges_tf: ${uma_lr.equil_charges_tf}
+  cutoff_lr: ${uma_lr.cutoff_lr}
+  max_neighbors_lr: null
+  hidden_channels_lr: 64
+  lr_output_scaling_factor: 0.1
+  conv_function_tf: false
+  normalize_charges_tf: true
+  return_bec: false
+
+heads:
+  omol:
+    module: esen_efs_head_lr
+    prefix: omol

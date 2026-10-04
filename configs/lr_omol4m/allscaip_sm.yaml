@@ -1,0 +1,59 @@
+# AllScAIP-small (6 layers, 512 hidden) trained from scratch on OMol-4M with a
+# conservative (energy-gradient) head, with or without long-range components.
+# Select the arm with the allscaip_lr group:
+#   fairchem -c configs/lr_omol4m/allscaip_sm.yaml allscaip_lr=coulomb
+# Arms: none, coulomb, coulomb_6A, coulomb_heis
+defaults:
+  - cluster: perlmutter
+  - dataset: omol_4M
+  - element_refs: omol_hof_lin_refs
+  - tasks: omol_conserving
+  - allscaip_lr: coulomb
+  - common
+  - _self_
+
+job:
+  run_name: allscaip_sm_omol4m_${allscaip_lr.name}_s${seed}
+  logger:
+    group: allscaip_sm
+
+max_atoms: 350
+dataset_list: ["omol"]
+knn_k: 30
+knn_pad_size: 50
+
+backbone:
+  model: fairchem.core.models.allscaip.AllScAIP.AllScAIPBackbone
+  num_layers: 6
+  hidden_size: 512
+  direct_forces: false
+  regress_forces: true
+  regress_stress: false
+  # the LR gradient head does not support compile; keep every arm uncompiled
+  # so the comparison shares one execution path
+  use_compile: false
+  use_padding: false
+  dataset_list: ${dataset_list}
+  use_node_path: true
+  use_freq_mask: false
+  use_sincx_mask: false
+  max_num_elements: 110
+  max_batch_size: 96
+  max_atoms: ${max_atoms}
+  max_radius: ${cutoff_radius}
+  knn_k: ${knn_k}
+  knn_soft: true
+  knn_sigmoid_scale: 0.2
+  knn_lse_scale: 0.1
+  knn_use_low_mem: true
+  knn_pad_size: ${knn_pad_size}
+  atten_name: memory_efficient
+  atten_num_heads: 8
+
+heads:
+  energyandforcehead:
+    module: fairchem.core.models.uma.escn_moe.DatasetSpecificSingleHeadWrapper
+    head_cls: ${allscaip_lr.head_cls}
+    head_kwargs: ${allscaip_lr.head_kwargs}
+    dataset_names:
+      - omol
