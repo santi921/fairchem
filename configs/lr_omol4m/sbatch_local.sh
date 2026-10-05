@@ -14,11 +14,11 @@
 # does not requeue on timeout; resume manually from the run's checkpoint.
 #
 # Usage:
-#   sbatch configs/lr_omol4m/sbatch_local.sh configs/lr_omol4m/uma_s_1p2p1.yaml uma_lr=coulomb
+#   sbatch configs/lr_omol4m/sbatch_local.sh configs/lr_omol4m/uma_direct.yaml uma_lr=coulomb
 set -euo pipefail
 
-# activate the fairchem environment here, e.g.
-# module load conda && conda activate fairchem
+module load python
+conda activate /pscratch/sd/s/santiago/envs/fairchem_lr
 
 export OMP_NUM_THREADS=8
 srun --ntasks=1 --gpus=4 fairchem -c "$@" cluster.mode=LOCAL

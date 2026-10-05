@@ -1,0 +1,36 @@
+# Phase 2: conservative finetuning of a uma_direct.yaml run. The backbone and
+# its LR settings come from the phase-1 checkpoint; the phase-1 energy head
+# (SR energy + LR charge networks) is carried into the gradient head.
+#   fairchem -c configs/lr_omol4m/uma_conserve.yaml \
+#     starting_checkpoint=<phase1 run>/checkpoints/final/inference_ckpt.pt \
+#     job.run_name=uma_omol4m_coul_all_conserve_s0
+defaults:
+  - cluster: perlmutter
+  - dataset: omol_4M
+  - element_refs: omol_hof_lin_refs
+  - tasks: omol
+  - phase: conserve
+  - common
+  - _self_
+
+job:
+  run_name: ???
+  logger:
+    group: uma_conserve
+
+starting_checkpoint: ???
+
+model:
+  _target_: fairchem.core.units.mlip_unit.mlip_unit.initialize_finetuning_model
+  checkpoint_location: ${starting_checkpoint}
+  overrides:
+    backbone:
+      direct_forces: false
+      regress_forces: true
+    pass_through_head_outputs: true
+  heads:
+    omol:
+      module: esen_efs_head_lr
+      prefix: omol
+  head_init_from:
+    omol: omol_energy

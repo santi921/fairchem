@@ -1,0 +1,9 @@
+# Phase 2: conservative (energy-gradient) finetuning from the phase-1
+# checkpoint, in fp32 (TF32 matmuls) for force accuracy.
+name: conserve
+epochs: 10
+lr: 4.e-4
+warmup_epochs: 0.1
+bf16: false
+energy_coef: 40
+force_coef: 20

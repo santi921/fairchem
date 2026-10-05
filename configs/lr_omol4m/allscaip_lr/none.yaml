@@ -1,5 +1,12 @@
-# Baseline AllScAIP conservative head (no long-range terms).
+# Baseline AllScAIP heads (no long-range terms).
+# Direct and conservative heads must share LR settings so the phase-1
+# energy head loads into the phase-2 head.
 name: nolr
-head_cls: fairchem.core.models.allscaip.AllScAIP.AllScAIPGradientEnergyForceStressHead
-head_kwargs:
+direct_heads:
+  omol_energy:
+    module: AllScAIP_energy_head
+  omol_forces:
+    module: AllScAIP_direct_force_head
+conserve_head_cls: fairchem.core.models.allscaip.AllScAIP.AllScAIPGradientEnergyForceStressHead
+conserve_head_kwargs:
   wrap_property: False

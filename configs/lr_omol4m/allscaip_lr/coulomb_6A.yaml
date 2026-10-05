@@ -1,7 +1,18 @@
 # Placebo control: Coulomb restricted to the 6 A short-range cutoff.
+# Direct and conservative heads must share LR settings so the phase-1
+# energy head loads into the phase-2 head.
 name: coul_6A
-head_cls: fairchem.core.models.allscaip.AllScAIP_lr.AllScAIPGradEnergyForceStressHeadLR
-head_kwargs:
+direct_heads:
+  omol_energy:
+    module: fairchem.core.models.allscaip.AllScAIP_lr.AllScAIPEnergyHeadLR
+    lr_pairs: all
+    cutoff_lr: 6.0
+    constrain_charge: True
+    heisenberg_tf: False
+  omol_forces:
+    module: AllScAIP_direct_force_head
+conserve_head_cls: fairchem.core.models.allscaip.AllScAIP_lr.AllScAIPGradEnergyForceStressHeadLR
+conserve_head_kwargs:
   wrap_property: False
   lr_pairs: all
   cutoff_lr: 6.0

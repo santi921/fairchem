@@ -1,0 +1,9 @@
+# Phase 1: direct-force pretraining. LR terms enter the energy only; forces
+# come from a short-range direct head.
+name: direct
+epochs: 60
+lr: 8.e-4
+warmup_epochs: 1
+bf16: true
+energy_coef: 10
+force_coef: 10

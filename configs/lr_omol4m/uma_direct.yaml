@@ -1,22 +1,25 @@
-# UMA-S-1.2.1 architecture (8 experts instead of 64) trained from scratch on
-# OMol-4M, with or without long-range components. Select the arm with the uma_lr group:
-#   fairchem -c configs/lr_omol4m/uma_s_1p2p1.yaml uma_lr=coulomb
+# Phase 1: UMA-S-1.2.1 architecture (8 experts instead of 64) trained from
+# scratch on OMol-4M with direct forces. Select the LR arm with uma_lr:
+#   fairchem -c configs/lr_omol4m/uma_direct.yaml uma_lr=coulomb
 # Arms: none, coulomb, coulomb_6A, coulomb_12A, coulomb_heis, coulomb_equil
+# Then finetune conservatively with uma_conserve.yaml.
 defaults:
   - cluster: perlmutter
   - dataset: omol_4M
   - element_refs: omol_hof_lin_refs
-  - tasks: omol_conserving
+  - tasks: omol
+  - phase: direct
   - uma_lr: coulomb
   - common
   - _self_
 
 job:
-  run_name: uma_s_1p2p1_omol4m_${uma_lr.name}_s${seed}
+  run_name: uma_omol4m_${uma_lr.name}_direct_s${seed}
   logger:
-    group: uma_s_1p2p1
+    group: uma_direct
 
 max_neighbors: 300  # effectively uncapped at 6 A, as in the 1.2.1 release
+cutoff_radius: 6.0
 
 backbone:
   model: escnmd_moe_backbone_lr
@@ -52,7 +55,7 @@ backbone:
   use_pbc_single: true
   regress_forces: true
   regress_stress: false
-  direct_forces: false
+  direct_forces: true
   # long-range settings (uma_lr group)
   latent_charge_tf: ${uma_lr.latent_charge_tf}
   heisenberg_tf: ${uma_lr.heisenberg_tf}
@@ -65,7 +68,13 @@ backbone:
   normalize_charges_tf: true
   return_bec: false
 
-heads:
-  omol:
-    module: esen_efs_head_lr
-    prefix: omol
+model:
+  _target_: fairchem.core.models.base.HydraModel
+  backbone: ${backbone}
+  heads:
+    # SR + LR energy; uma_conserve.yaml carries this head's weights over
+    omol_energy:
+      module: esen_mlp_energy_head_lr
+    omol_forces:
+      module: fairchem.core.models.uma.escn_md.Linear_Force_Head
+  pass_through_head_outputs: false

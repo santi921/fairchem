@@ -1,23 +1,25 @@
-# AllScAIP-small (6 layers, 512 hidden) trained from scratch on OMol-4M with a
-# conservative (energy-gradient) head, with or without long-range components.
-# Select the arm with the allscaip_lr group:
-#   fairchem -c configs/lr_omol4m/allscaip_sm.yaml allscaip_lr=coulomb
+# Phase 1: AllScAIP-small (6 layers, 512 hidden) trained from scratch on
+# OMol-4M with direct forces. Select the LR arm with allscaip_lr:
+#   fairchem -c configs/lr_omol4m/allscaip_direct.yaml allscaip_lr=coulomb
 # Arms: none, coulomb, coulomb_6A, coulomb_heis
+# Then finetune conservatively with allscaip_conserve.yaml (same arm).
 defaults:
   - cluster: perlmutter
   - dataset: omol_4M
   - element_refs: omol_hof_lin_refs
-  - tasks: omol_conserving
+  - tasks: omol
+  - phase: direct
   - allscaip_lr: coulomb
   - common
   - _self_
 
 job:
-  run_name: allscaip_sm_omol4m_${allscaip_lr.name}_s${seed}
+  run_name: allscaip_omol4m_${allscaip_lr.name}_direct_s${seed}
   logger:
-    group: allscaip_sm
+    group: allscaip_direct
 
 max_atoms: 350
+cutoff_radius: 6.0
 dataset_list: ["omol"]
 knn_k: 30
 knn_pad_size: 50
@@ -26,13 +28,13 @@ backbone:
   model: fairchem.core.models.allscaip.AllScAIP.AllScAIPBackbone
   num_layers: 6
   hidden_size: 512
-  direct_forces: false
+  direct_forces: true
   regress_forces: true
   regress_stress: false
-  # the LR gradient head does not support compile; keep every arm uncompiled
-  # so the comparison shares one execution path
+  # direct forces pad nodes to max_atoms; compile is untested with the LR
+  # heads, so every arm runs uncompiled to share one execution path
   use_compile: false
-  use_padding: false
+  use_padding: true
   dataset_list: ${dataset_list}
   use_node_path: true
   use_freq_mask: false
@@ -50,10 +52,9 @@ backbone:
   atten_name: memory_efficient
   atten_num_heads: 8
 
-heads:
-  energyandforcehead:
-    module: fairchem.core.models.uma.escn_moe.DatasetSpecificSingleHeadWrapper
-    head_cls: ${allscaip_lr.head_cls}
-    head_kwargs: ${allscaip_lr.head_kwargs}
-    dataset_names:
-      - omol
+model:
+  _target_: fairchem.core.models.base.HydraModel
+  backbone: ${backbone}
+  # allscaip_conserve.yaml carries the omol_energy head's weights over
+  heads: ${allscaip_lr.direct_heads}
+  pass_through_head_outputs: false

@@ -1,0 +1,43 @@
+# Phase 2: conservative finetuning of an allscaip_direct.yaml run. Use the same
+# allscaip_lr arm as phase 1: the LR settings live in the head arguments, and
+# the phase-1 energy head (SR energy + LR charge networks) is loaded strictly
+# into the gradient head, so a mismatched arm fails at startup.
+#   fairchem -c configs/lr_omol4m/allscaip_conserve.yaml allscaip_lr=coulomb \
+#     starting_checkpoint=<phase1 run>/checkpoints/final/inference_ckpt.pt
+defaults:
+  - cluster: perlmutter
+  - dataset: omol_4M
+  - element_refs: omol_hof_lin_refs
+  - tasks: omol
+  - phase: conserve
+  - allscaip_lr: coulomb
+  - common
+  - _self_
+
+job:
+  run_name: allscaip_omol4m_${allscaip_lr.name}_conserve_s${seed}
+  logger:
+    group: allscaip_conserve
+
+starting_checkpoint: ???
+max_atoms: 350
+
+model:
+  _target_: fairchem.core.units.mlip_unit.mlip_unit.initialize_finetuning_model
+  checkpoint_location: ${starting_checkpoint}
+  overrides:
+    backbone:
+      direct_forces: false
+      regress_forces: true
+      use_padding: false
+      use_compile: false
+    pass_through_head_outputs: true
+  heads:
+    energyandforcehead:
+      module: fairchem.core.models.uma.escn_moe.DatasetSpecificSingleHeadWrapper
+      head_cls: ${allscaip_lr.conserve_head_cls}
+      head_kwargs: ${allscaip_lr.conserve_head_kwargs}
+      dataset_names:
+        - omol
+  head_init_from:
+    energyandforcehead.head: omol_energy

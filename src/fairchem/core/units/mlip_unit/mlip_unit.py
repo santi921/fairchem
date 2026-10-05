@@ -144,7 +144,25 @@ def initialize_finetuning_model(
     overrides: dict | None = None,
     heads: dict | None = None,
     strict: bool = True,
+    head_init_from: dict[str, str] | None = None,
 ) -> torch.nn.Module:
+    """
+    Load a checkpoint for finetuning, optionally replacing its output heads.
+
+    Args:
+        checkpoint_location: Path to an inference checkpoint.
+        overrides: Model config overrides applied when loading.
+        heads: New head configs. If None, the checkpoint heads are kept.
+        strict: Strict state-dict loading for the checkpoint model.
+        head_init_from: Maps a new head (optionally a dotted submodule path,
+            e.g. "energyandforcehead.head") to the name of a checkpoint head
+            whose weights it should start from. Loading is strict, so the
+            two heads must have identical parameter names, e.g. a direct
+            LR energy head and its conservative counterpart.
+
+    Returns:
+        The model ready for finetuning.
+    """
     model, checkpoint = load_inference_model(
         checkpoint_location, overrides, strict=strict
     )
@@ -161,6 +179,7 @@ def initialize_finetuning_model(
     checkpoint.model_config["heads"] = deepcopy(heads)
     model.finetune_model_full_config = checkpoint.model_config
 
+    checkpoint_heads = model.output_heads
     model.output_heads = None
     model.heads = heads
     del model.output_heads
@@ -181,6 +200,16 @@ def initialize_finetuning_model(
             **head_config,
         )
     model.output_heads = torch.nn.ModuleDict(model.output_heads)
+
+    for target_path, source_name in (head_init_from or {}).items():
+        head_name, _, submodule = target_path.partition(".")
+        target = model.output_heads[head_name]
+        if submodule:
+            target = target.get_submodule(submodule)
+        target.load_state_dict(checkpoint_heads[source_name].state_dict())
+        logging.warning(
+            f"Initialized head {target_path} from checkpoint head {source_name}"
+        )
     return model
 
 

@@ -374,6 +374,10 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
 - `eSCNMDBackboneLR` subclasses `eSCNMDBackbone` and only adds
   `edge_index_lr`; keep LR physics in the heads so upstream backbone changes
   apply automatically.
+- `initialize_finetuning_model` rebuilds every head when `heads` is given, so
+  head weights (including LR charge networks) restart from scratch. Pass
+  `head_init_from={new_head[.submodule]: checkpoint_head}` to carry them; the
+  load is strict.
 - The repo `.gitignore` ignores `*yaml`, `*yml`, `*pt` and `*ipynb`, so new
   configs are silently left out of commits. Add them with `git add -f` and
   confirm with `git ls-files` before pushing.
