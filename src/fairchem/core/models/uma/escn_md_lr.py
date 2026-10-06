@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -135,10 +136,11 @@ class eSCNMDBackboneLR(eSCNMDBackbone):
         if cutoff_lr is not None and cutoff_lr < 0.0:
             cutoff_lr = self.cutoff
         self.cutoff_lr = cutoff_lr
+        self._warned_periodic_all_pairs = False
 
-    def _images_out_of_reach(self, data_dict: AtomicData) -> bool:
+    def _images_out_of_reach(self, data_dict: AtomicData, cutoff: float) -> bool:
         """
-        Whether no periodic image can fall within the LR cutoff of any atom.
+        Whether no periodic image can fall within cutoff of any atom.
 
         Molecular datasets such as OMol box each molecule in a large vacuum
         cell with pbc=True, so the pbc flags alone cannot identify isolated
@@ -169,12 +171,27 @@ class eSCNMDBackboneLR(eSCNMDBackbone):
             0, batch.unsqueeze(1).expand(-1, 3), pos, reduce="amax"
         )
         extent = (hi - lo).norm(dim=1)
-        reach = extent + (extent if self.cutoff_lr is None else self.cutoff_lr)
-        return bool((min_height > reach).all())
+        return bool((min_height > extent + cutoff).all())
 
     @torch.no_grad()
     def _generate_lr_graph(self, data_dict: AtomicData) -> torch.Tensor:
-        if self._images_out_of_reach(data_dict):
+        if self.cutoff_lr is None:
+            # all intra-system pairs ignore periodic images by definition; warn
+            # once if a system is not isolated even at the short-range cutoff
+            if not self._warned_periodic_all_pairs and not self._images_out_of_reach(
+                data_dict, self.cutoff
+            ):
+                logging.warning(
+                    "cutoff_lr=None ignores periodic images, but a batch has "
+                    f"images within {self.cutoff} A; use a finite cutoff_lr or "
+                    "use_ewald_tf for periodic systems"
+                )
+                self._warned_periodic_all_pairs = True
+            return intra_system_lr_edges(
+                data_dict["pos"], data_dict["batch"], None, self.max_neighbors_lr
+            )
+
+        if self._images_out_of_reach(data_dict, self.cutoff_lr):
             return intra_system_lr_edges(
                 data_dict["pos"],
                 data_dict["batch"],
@@ -184,8 +201,6 @@ class eSCNMDBackboneLR(eSCNMDBackbone):
 
         # Periodic systems: the direct Coulomb sum ignores image offsets, so
         # this graph is only exact when use_ewald_tf handles the electrostatics.
-        if self.cutoff_lr is None:
-            raise ValueError("cutoff_lr=None (all pairs) requires non-periodic input")
         graph_dict = generate_graph(
             data_dict,
             cutoff=self.cutoff_lr,
@@ -200,7 +215,8 @@ class eSCNMDBackboneLR(eSCNMDBackbone):
         if gp_utils.initialized():
             raise NotImplementedError("eSCNMDBackboneLR does not support GP")
         out = super().forward(data_dict)
-        out["edge_index_lr"] = self._generate_lr_graph(data_dict)
+        if self.latent_charge_tf:
+            out["edge_index_lr"] = self._generate_lr_graph(data_dict)
         return out
 
 

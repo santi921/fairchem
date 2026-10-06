@@ -200,3 +200,48 @@ def test_moe_lr_backbone_with_uma_1p2_options():
     assert out["energy"]["energy"].shape == (2,)
     assert out["forces"]["forces"].shape == (data["pos"].shape[0], 3)
     assert torch.isfinite(out["forces"]["forces"]).all()
+
+
+def _get_elongated_boxed_molecule() -> AtomicData:
+    # two waters 150 A apart in an OMol-style 120 A vacuum box (pbc=True); the
+    # system extent exceeds half the cell height
+    atoms = get_molecule("H2O")
+    far = get_molecule("H2O")
+    far.translate([150.0, 0.0, 0.0])
+    atoms += far
+    atoms.info.update(charge=0, spin=1)
+    return AtomicData.from_ase(
+        input_atoms=atoms,
+        task_name="lr_test",
+        r_edges=False,
+        r_data_keys=["spin", "charge"],
+        molecule_cell_size=120.0,
+    )
+
+
+def test_all_pairs_lr_graph_handles_elongated_boxed_molecule():
+    data = _get_elongated_boxed_molecule()
+    assert data["pbc"].all()
+    backbone = eSCNMDBackboneLR(cutoff_lr=None, **BACKBONE_KWARGS)
+
+    out = backbone(data)
+
+    n = data["pos"].shape[0]
+    assert out["edge_index_lr"].shape[1] == n * (n - 1)
+
+
+def test_finite_lr_cutoff_uses_intra_system_pairs_in_vacuum_box():
+    data = _get_elongated_boxed_molecule()
+    backbone = eSCNMDBackboneLR(cutoff_lr=12.0, **BACKBONE_KWARGS)
+
+    src, dst = backbone(data)["edge_index_lr"]
+
+    assert ((data["pos"][src] - data["pos"][dst]).norm(dim=-1) < 12.0).all()
+
+
+def test_lr_graph_skipped_when_lr_disabled():
+    backbone = eSCNMDBackboneLR(latent_charge_tf=False, **BACKBONE_KWARGS)
+
+    out = backbone(_get_elongated_boxed_molecule())
+
+    assert "edge_index_lr" not in out
