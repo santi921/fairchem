@@ -13,6 +13,9 @@ account: m3278_g
 qos: regular
 additional_parameters:
   constraint: gpu
+  # submitit requeues at the time limit via scontrol requeue, which Slurm
+  # rejects unless the job was submitted as requeueable
+  requeue: true
   mail-user: santiagovargas@lbl.gov
   mail-type: ALL
 
