@@ -18,6 +18,10 @@
 set -euo pipefail
 
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+command -v fairchem >/dev/null || {
+  echo "fairchem not found: module load python && conda activate /pscratch/sd/s/santiago/envs/fairchem_lr" >&2
+  exit 1
+}
 D=configs/lr_omol4m
 EXTRA=${EXTRA:-}
 
