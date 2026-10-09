@@ -58,7 +58,9 @@ resume() {
   local run=$1 latest
   latest=$(ls -td "$run"/checkpoints/step_*/ 2>/dev/null | head -1)
   [ -n "$latest" ] || { echo "no step_* checkpoints in $run/checkpoints" >&2; exit 1; }
-  submit "${latest%/}/resume.yaml"
+  # runs launched before --requeue was in the cluster config lack it; ++ adds
+  # or overrides, so this works whether or not resume.yaml already has the key
+  submit "${latest%/}/resume.yaml" "++job.scheduler.slurm.additional_parameters.requeue=true"
 }
 
 case "${1:-}" in

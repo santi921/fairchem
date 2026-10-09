@@ -381,6 +381,10 @@ configs/                 # Hydra YAML configs (datasets, tasks, backbone, optimi
 - The repo `.gitignore` ignores `*yaml`, `*yml`, `*pt` and `*ipynb`, so new
   configs are silently left out of commits. Add them with `git add -f` and
   confirm with `git ls-files` before pushing.
+- When overriding a saved `resume.yaml`, use `++key=value` (add or override).
+  `+key` fails with "Could not append to config" if an earlier resume already
+  added the key, and that `ConfigCompositionException` message contains no
+  "Error", so grep-based log filters hide it.
 - Training configs reject top-level keys that are referenced only from `job`
   (fairchem resolves `job` before its unused-key check). Put run names and
   logger groups directly under `job`.
